@@ -22,6 +22,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements-dev.txt
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Verify publish input
@@ -49,4 +50,3 @@ jobs:
             org.opencontainers.image.source=https://github.com/e-eugene/hermes-agent
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
