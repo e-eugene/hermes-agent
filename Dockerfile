@@ -17,6 +17,7 @@ RUN apt-get update \
         fonts-noto-core \
         openbox \
         socat \
+        x11vnc \
         x11-utils \
         xvfb \
     && rm -rf /var/lib/apt/lists/*
@@ -25,6 +26,8 @@ COPY runtime/hermes-browser-supervisor.sh /usr/local/bin/hermes-browser-supervis
 COPY runtime/wait-for-hermes-browser.sh /usr/local/bin/wait-for-hermes-browser
 COPY runtime/residential-proxy.py /usr/local/bin/residential-proxy
 COPY runtime/social-account.py /usr/local/bin/social-account
+COPY runtime/hermes-browser-gateway.py /usr/local/bin/hermes-browser-gateway
+COPY runtime/hermes-browser-network-status.py /usr/local/bin/hermes-browser-network-status
 COPY runtime/hermes-runtime-entrypoint.sh /usr/local/bin/hermes-runtime-entrypoint
 COPY runtime/hermes-runtime-health.py /usr/local/bin/hermes-runtime-health
 
@@ -33,6 +36,8 @@ RUN chmod 0755 \
     /usr/local/bin/wait-for-hermes-browser \
     /usr/local/bin/residential-proxy \
     /usr/local/bin/social-account \
+    /usr/local/bin/hermes-browser-gateway \
+    /usr/local/bin/hermes-browser-network-status \
     /usr/local/bin/hermes-runtime-entrypoint \
     /usr/local/bin/hermes-runtime-health
 
@@ -41,7 +46,7 @@ ENV DISPLAY=:99 \
     AGENT_BROWSER_HEADED=true \
     BROWSER_CDP_URL=http://127.0.0.1:9222
 
-EXPOSE 8642 8643 9120
+EXPOSE 6081 8642 8643 9120
 
 LABEL org.opencontainers.image.source="https://github.com/e-eugene/hermes-agent" \
       org.opencontainers.image.title="Hermes Agent Browser Runtime" \

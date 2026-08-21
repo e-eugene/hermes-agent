@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -25,6 +26,8 @@ CDP_VERSION_URL = os.environ.get(
     "BROWSER_CDP_VERSION_URL",
     "http://127.0.0.1:9222/json/version",
 )
+ATTENTION_SCREENSHOT = Path("/opt/data/browser/x-manual-attention.png")
+NETWORK_MODES = {"assigned_proxy", "direct"}
 
 
 def load_accounts() -> list[dict[str, Any]]:
@@ -46,7 +49,11 @@ def public_account(account: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def assigned_account(account_type: str) -> dict[str, Any]:
+def assigned_social_account(
+    account_type: str,
+    *,
+    require_password: bool = True,
+) -> dict[str, Any]:
     matches = [
         account
         for account in load_accounts()
@@ -55,9 +62,15 @@ def assigned_account(account_type: str) -> dict[str, Any]:
     if not matches:
         raise RuntimeError(f"No active {account_type} account is assigned")
     account = matches[0]
-    if not account.get("login") or not account.get("password"):
+    if not account.get("login") or (require_password and not account.get("password")):
         raise RuntimeError(f"Assigned {account_type} account has no credentials")
     return account
+
+
+def assigned_account(account_type: str) -> dict[str, Any]:
+    """Backward-compatible credential-required account lookup."""
+
+    return assigned_social_account(account_type, require_password=True)
 
 
 class CdpClient:
@@ -219,9 +232,28 @@ class CdpClient:
         )
 
 
+def browser_network_mode() -> str:
+    """Resolve the explicit browser mode without silently falling back to direct."""
+
+    configured = os.environ.get("HERMES_BROWSER_NETWORK_MODE")
+    if configured:
+        if configured not in NETWORK_MODES:
+            raise RuntimeError("Browser network mode is invalid")
+        return configured
+    # Older image consumers did not set a mode. Retain their existing behavior:
+    # a configured bridge means proxy mode; otherwise the browser is direct.
+    return (
+        "assigned_proxy"
+        if os.environ.get("HERMES_RESIDENTIAL_PROXY_ENABLED") == "true"
+        else "direct"
+    )
+
+
 def ensure_sticky_proxy() -> None:
-    if os.environ.get("HERMES_RESIDENTIAL_PROXY_ENABLED", "false") != "true":
+    if browser_network_mode() == "direct":
         return
+    if os.environ.get("HERMES_RESIDENTIAL_PROXY_ENABLED") != "true":
+        raise RuntimeError("Assigned proxy browser mode requires an active proxy")
     result = subprocess.run(
         ["/usr/local/bin/residential-proxy", "sticky"],
         capture_output=True,
@@ -287,25 +319,311 @@ def login_reddit(
             cdp.close()
 
 
+class XBrowser:
+    """Minimal CDP client for the single persistent Chromium X profile."""
+
+    def __init__(self) -> None:
+        with urllib.request.urlopen(CDP_VERSION_URL, timeout=5) as response:  # nosec B310
+            websocket_url = json.load(response)["webSocketDebuggerUrl"]
+        self.websocket = connect(
+            websocket_url,
+            open_timeout=5,
+            close_timeout=1,
+            proxy=None,
+        )
+        self.request_id = 0
+        self.session_id = self._page_session()
+
+    def close(self) -> None:
+        self.websocket.close()
+
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        session: bool = True,
+        timeout: float = 12,
+    ) -> dict[str, Any]:
+        self.request_id += 1
+        request_id = self.request_id
+        message: dict[str, Any] = {
+            "id": request_id,
+            "method": method,
+            "params": params or {},
+        }
+        if session and hasattr(self, "session_id"):
+            message["sessionId"] = self.session_id
+        self.websocket.send(json.dumps(message))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            response = json.loads(
+                self.websocket.recv(timeout=max(0.1, deadline - time.monotonic()))
+            )
+            if response.get("id") != request_id:
+                continue
+            if response.get("error"):
+                raise RuntimeError("Chromium X-account command failed")
+            return response.get("result") or {}
+        raise RuntimeError("Chromium X-account command timed out")
+
+    def _page_session(self) -> str:
+        targets = self.request("Target.getTargets", session=False).get(
+            "targetInfos", []
+        )
+        pages = [item for item in targets if item.get("type") == "page"]
+        x_pages = [item for item in pages if "x.com" in str(item.get("url") or "")]
+        target = (x_pages or pages)[-1] if (x_pages or pages) else None
+        target_id = (
+            target["targetId"]
+            if target
+            else self.request(
+                "Target.createTarget", {"url": "about:blank"}, session=False
+            )["targetId"]
+        )
+        return self.request(
+            "Target.attachToTarget",
+            {"targetId": target_id, "flatten": True},
+            session=False,
+        )["sessionId"]
+
+    def evaluate(self, expression: str, *, timeout: float = 15) -> Any:
+        result = self.request(
+            "Runtime.evaluate",
+            {"expression": expression, "awaitPromise": True, "returnByValue": True},
+            timeout=timeout,
+        )
+        if result.get("exceptionDetails"):
+            raise RuntimeError("X page evaluation failed")
+        return (result.get("result") or {}).get("value")
+
+    def navigate(self, url: str) -> None:
+        self.request("Page.enable")
+        self.request("Page.navigate", {"url": url})
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                if self.evaluate("document.readyState") == "complete":
+                    return
+            except RuntimeError:
+                pass
+            time.sleep(0.25)
+        raise RuntimeError("X page did not finish loading")
+
+    def wait_for(self, expression: str, timeout: float = 20) -> Any:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            value = self.evaluate(expression)
+            if value:
+                return value
+            time.sleep(0.4)
+        return None
+
+    def capture_attention(self) -> None:
+        try:
+            self.request("Page.enable")
+            value = self.request("Page.captureScreenshot", {"format": "png"}).get(
+                "data"
+            )
+            if value:
+                ATTENTION_SCREENSHOT.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                ATTENTION_SCREENSHOT.write_bytes(base64.b64decode(value))
+                ATTENTION_SCREENSHOT.chmod(0o600)
+        except (OSError, ValueError, RuntimeError):
+            pass
+
+
+def normalized_login(value: str) -> str:
+    return value.strip().lstrip("@").lower()
+
+
+def x_current_user(cdp: XBrowser) -> str | None:
+    result = cdp.evaluate("""
+        fetch('/i/api/1.1/account/settings.json', {credentials: 'include'})
+          .then(async response => {
+            if (!response.ok) return null;
+            const value = await response.json();
+            return value.screen_name || null;
+          }).catch(() => null)
+        """)
+    return str(result) if result else None
+
+
+def x_challenge(cdp: XBrowser) -> str | None:
+    return cdp.evaluate("""
+        (() => {
+          const text = (document.body?.innerText || '').toLowerCase();
+          if (document.querySelector('iframe[src*="captcha"], [data-testid*="captcha"]') || text.includes('captcha')) return 'CAPTCHA';
+          if (document.querySelector('input[autocomplete="one-time-code"]') || text.includes('authentication code') || text.includes('verification code')) return '2FA';
+          if (text.includes('unusual activity') || text.includes('verify your identity') || text.includes('enter your phone') || text.includes('enter your email')) return 'challenge';
+          return null;
+        })()
+        """)
+
+
+def inspect_x(account: dict[str, Any], *, cdp: XBrowser) -> dict[str, Any]:
+    cdp.navigate("https://x.com/home")
+    actual = x_current_user(cdp)
+    expected = str(account["login"])
+    if actual and normalized_login(actual) == normalized_login(expected):
+        return {"status": "authenticated", "type": "x", "login": expected}
+    if actual:
+        return {
+            "status": "wrong_account",
+            "type": "x",
+            "login": expected,
+            "error": "Chromium is authenticated as another X account",
+        }
+    attention = x_challenge(cdp)
+    if attention:
+        cdp.capture_attention()
+        return {
+            "status": "manual_attention",
+            "type": "x",
+            "login": expected,
+            "error": f"X requires manual {attention} completion",
+        }
+    return {"status": "not_logged_in", "type": "x", "login": expected}
+
+
+def fill_x(cdp: XBrowser, selector: str, value: str) -> bool:
+    expression = f"""
+    (() => {{
+      const node = document.querySelector({json.dumps(selector)});
+      if (!node) return false;
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(node, {json.dumps(value)});
+      node.dispatchEvent(new Event('input', {{bubbles: true}}));
+      node.dispatchEvent(new Event('change', {{bubbles: true}}));
+      node.focus();
+      return true;
+    }})()
+    """
+    return bool(cdp.evaluate(expression))
+
+
+def click_x_text(cdp: XBrowser, text: str) -> bool:
+    return bool(cdp.evaluate(f"""
+            (() => {{
+              const expected = {json.dumps(text.lower())};
+              const node = [...document.querySelectorAll('button, [role="button"]')]
+                .find(item => (item.innerText || '').trim().toLowerCase() === expected);
+              if (!node) return false;
+              node.click();
+              return true;
+            }})()
+            """))
+
+
+def login_x(account: dict[str, Any], *, cdp: XBrowser) -> dict[str, Any]:
+    existing = inspect_x(account, cdp=cdp)
+    # A challenge is intentionally resolved only by the operator in the
+    # persistent Remote Chromium session. Navigating to the login flow here
+    # would discard the CAPTCHA/2FA screen we need them to complete.
+    if existing["status"] in {
+        "authenticated",
+        "wrong_account",
+        "manual_attention",
+    }:
+        return existing
+    cdp.navigate("https://x.com/i/flow/login")
+    if not cdp.wait_for(
+        "document.querySelector('input[autocomplete=\"username\"]') !== null"
+    ):
+        cdp.capture_attention()
+        return {
+            **existing,
+            "status": "manual_attention",
+            "error": "X login form requires manual attention",
+        }
+    x_login = str(account["login"]).lstrip("@")
+    if not fill_x(cdp, 'input[autocomplete="username"]', x_login) or not click_x_text(cdp, "Next"):
+        raise RuntimeError("Could not submit the X username step")
+    password_ready = cdp.wait_for(
+        "document.querySelector('input[name=\"password\"]') !== null || (document.body?.innerText || '').toLowerCase().includes('verify')",
+        20,
+    )
+    if not password_ready or x_challenge(cdp):
+        cdp.capture_attention()
+        return {
+            "status": "manual_attention",
+            "type": "x",
+            "login": str(account["login"]),
+            "error": "X requires a manual identity challenge",
+        }
+    if not fill_x(cdp, 'input[name="password"]', str(account["password"])):
+        raise RuntimeError("X password field was not found")
+    if not bool(cdp.evaluate("""
+        (() => {
+          const button = document.querySelector('[data-testid="LoginForm_Login_Button"]');
+          if (!button) return false;
+          button.click();
+          return true;
+        })()
+        """)):
+        raise RuntimeError("X login submit button was not found")
+    deadline = time.monotonic() + 35
+    while time.monotonic() < deadline:
+        time.sleep(0.7)
+        actual = x_current_user(cdp)
+        if actual:
+            return inspect_x(account, cdp=cdp)
+        attention = x_challenge(cdp)
+        if attention:
+            cdp.capture_attention()
+            return {
+                "status": "manual_attention",
+                "type": "x",
+                "login": str(account["login"]),
+                "error": f"X requires manual {attention} completion",
+            }
+    cdp.capture_attention()
+    return {
+        "status": "manual_attention",
+        "type": "x",
+        "login": str(account["login"]),
+        "error": "X did not complete login; continue in remote Chromium",
+    }
+
+
+def x_account_action(action: str) -> dict[str, Any]:
+    account = assigned_social_account("x", require_password=action == "login")
+    cdp = XBrowser()
+    try:
+        return inspect_x(account, cdp=cdp) if action == "status" else login_x(account, cdp=cdp)
+    finally:
+        cdp.close()
+
+
 def command() -> None:
     action = sys.argv[1] if len(sys.argv) > 1 else "list"
+    account_type = sys.argv[2] if len(sys.argv) > 2 else ""
     try:
-        if action in {"list", "status"}:
+        if action == "list" or (action == "status" and not account_type):
             accounts = [public_account(account) for account in load_accounts()]
             print(json.dumps({"accounts": accounts}))
             return
-        if action == "login":
-            account_type = sys.argv[2] if len(sys.argv) > 2 else ""
-            if account_type != "reddit":
-                raise RuntimeError(
-                    "usage: social-account login reddit (other providers are not implemented)"
-                )
-            print(json.dumps(login_reddit(assigned_account(account_type))))
+        if action == "status" and account_type == "x":
+            ensure_sticky_proxy()
+            print(json.dumps(x_account_action("status")))
             return
-        raise RuntimeError("usage: social-account [list|status|login reddit]")
+        if action == "login":
+            if account_type == "reddit":
+                print(json.dumps(login_reddit(assigned_account(account_type))))
+                return
+            if account_type == "x":
+                ensure_sticky_proxy()
+                print(json.dumps(x_account_action("login")))
+                return
+        raise RuntimeError("usage: social-account [list|status x|login reddit|login x]")
     except RuntimeError as exc:
         print(json.dumps({"status": "error", "error": str(exc)}))
         raise SystemExit(1) from exc
+    except Exception:
+        # CDP/websocket library errors can vary by version. The dashboard gets
+        # a generic result instead of an implementation traceback or stderr.
+        print(json.dumps({"status": "error", "error": "Social-account helper failed"}))
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

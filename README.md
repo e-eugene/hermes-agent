@@ -39,7 +39,8 @@ The image exposes these private-network ports:
 | Port | Purpose | Authentication |
 | --- | --- | --- |
 | `8642` | Hermes API server | `Authorization: Bearer <API_SERVER_KEY>` |
-| `8643` | Aggregate readiness endpoint at `/health` | `Authorization: Bearer <API_SERVER_KEY>` |
+| `8643` | Runtime control: readiness, X account status/login, browser network status | `Authorization: Bearer <API_SERVER_KEY>` |
+| `6081` | Binary WebSocket bridge to the loopback Remote Chromium VNC server | `Authorization: Bearer <API_SERVER_KEY>` |
 | `9120` | Dual-stack Hermes TUI and WebSocket bridge | Hermes bearer/session token |
 
 Do not assign public domains to these ports. Place the runtime on a private
@@ -49,6 +50,28 @@ HTTP/WebSocket traffic on the dual-stack bridge because upstream Hermes refuses
 direct non-loopback dashboard binds without a registered auth provider.
 Hermes API binds IPv6 directly and an internal `socat` listener forwards IPv4
 connections to it, so private clients can use either Railway address family.
+
+### Private runtime control API
+
+The service on `8643` is private-only and requires `Authorization: Bearer
+<API_SERVER_KEY>`. It exposes a small redacted contract for the dashboard:
+
+- `GET /health` returns runtime readiness plus
+  `capabilities: ["x_social_account", "remote_chromium", "network_status"]`
+  and the last browser-network snapshot in `network`.
+- `GET /network/status` makes a one-off request from the actual headed Chromium
+  CDP browser to a fixed public IP-echo endpoint. It returns only
+  `{status: "healthy"|"unhealthy"|"unavailable", mode,
+  exit_ip?, error?}`; no proxy configuration is exposed.
+- `POST /social-accounts/x/status` and
+  `POST /social-accounts/x/login` return the assigned handle and one of
+  `authenticated`, `not_logged_in`, `wrong_account`, `manual_attention`, or a
+  redacted error. CAPTCHA, 2FA and an already signed-in different account are
+  never bypassed automatically.
+
+Remote Chromium connects through a single-controller, binary WebSocket bridge
+on `6081`. It forwards only to an `x11vnc` process bound to container loopback;
+the browser profile, CDP and VNC ports are never public.
 
 ## Environment contract
 
@@ -70,6 +93,7 @@ The runtime entrypoint expects the following core variables:
 | `HERMES_TUI_WS_ORPHAN_REAP_GRACE_SECONDS` | yes | TUI orphan WebSocket grace period, normally `120`. |
 | `HERMES_SOCIAL_ACCOUNTS_PATH` | yes | Use `/tmp/hermes-secrets/social-accounts.json`. |
 | `HERMES_SOCIAL_ACCOUNTS_JSON` | no | JSON array of assigned accounts; defaults to `[]`. |
+| `HERMES_RUNTIME_CONTEXT` | no | Dashboard-generated, non-secret system guidance. It is written deterministically to `agent.system_prompt` on each boot and cleared when empty. |
 
 Provider credentials are passed using the variables understood by Hermes:
 
@@ -89,11 +113,14 @@ Browser settings have safe image defaults:
 | `HERMES_BROWSER_PROFILE_DIR` | `/opt/data/browser-profile` | Persistent Chromium profile. |
 | `HERMES_BROWSER_STATE_DIR` | `/opt/data/browser` | Browser and supervisor logs. |
 | `BROWSER_CDP_URL` | `http://127.0.0.1:9222` | Hermes browser tool CDP endpoint. |
+| `HERMES_BROWSER_GATEWAY_PORT` | `6081` | Private authenticated Remote Chromium WebSocket port. |
+| `HERMES_BROWSER_NETWORK_MODE` | Derived for legacy callers | `assigned_proxy` starts Chromium through the allocated bridge; `direct` starts Chromium without proxy credentials. Dashboard deployments must set this explicitly. |
 
 ### Residential proxy
 
-Set `HERMES_RESIDENTIAL_PROXY_ENABLED=true` to route Chromium through the
-local authenticated proxy bridge. These variables then become required:
+Set `HERMES_BROWSER_NETWORK_MODE=assigned_proxy` and
+`HERMES_RESIDENTIAL_PROXY_ENABLED=true` to route Chromium through the local
+authenticated proxy bridge. These variables then become required:
 
 - `HERMES_RESIDENTIAL_PROXY_HOST`
 - `HERMES_RESIDENTIAL_PROXY_ENDPOINT_PORT`
@@ -107,6 +134,12 @@ and `HERMES_RESIDENTIAL_PROXY_STATE_PATH` (default
 `/opt/data/residential-proxy/state.json`). The upstream username is constructed
 as `<base>-<country>-city_<city>-<session>`, matching the expected residential
 proxy account format.
+
+`HERMES_BROWSER_NETWORK_MODE=direct` is an explicit operational choice. The
+entrypoint removes all inherited proxy variables before child processes start,
+so Chromium, browser tools, Remote Chromium and social-account actions are all
+visibly direct for that deployment. There is no request-level direct fallback
+while in `assigned_proxy` mode.
 
 The `residential-proxy` command inside the container supports `status`, `url`,
 `sticky [session-id]`, and `rotate`. It never prints upstream credentials.
@@ -130,8 +163,21 @@ The `residential-proxy` command inside the container supports `status`, `url`,
 This is a runtime interface example only; never commit real values. On startup,
 the entrypoint writes the array to the configured temporary path, applies mode
 `0600`, atomically replaces any old file, and unsets the JSON variable in the
-entrypoint process. The `social-account` command exposes only redacted status
-and currently implements automated login for Reddit.
+entrypoint process. The `social-account` command exposes only redacted status.
+It supports existing Reddit login plus X commands used by Hermes and the
+dashboard:
+
+```sh
+social-account status x
+social-account login x
+```
+
+The X helper uses the same persistent headed Chromium profile and selected
+browser network mode as Hermes Browser tools. It will fill the assigned login
+and password only into X's page. It never prints credentials, logs out a
+different account, clears cookies, or attempts to solve CAPTCHA/2FA. Those
+states return `manual_attention` or `wrong_account` and must be completed in
+Remote Chromium before retrying Status.
 
 ## Secret handling
 

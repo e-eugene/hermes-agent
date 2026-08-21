@@ -117,6 +117,95 @@ def test_sticky_proxy_is_optional_for_direct_browser_runtime(
     helper.ensure_sticky_proxy()
 
 
+def test_x_status_reads_login_without_requiring_password(helper, tmp_path) -> None:
+    helper.ACCOUNTS_PATH = tmp_path / "social-accounts.json"
+    helper.ACCOUNTS_PATH.write_text(
+        json.dumps(
+            [
+                {
+                    "type": "x",
+                    "login": "assigned-handle",
+                    "is_active": True,
+                }
+            ]
+        )
+    )
+
+    result = helper.assigned_social_account("x", require_password=False)
+
+    assert result == {
+        "type": "x",
+        "login": "assigned-handle",
+        "is_active": True,
+    }
+    with pytest.raises(RuntimeError, match="has no credentials"):
+        helper.assigned_social_account("x", require_password=True)
+
+
+def test_x_status_keeps_a_different_signed_in_account_and_never_uses_password(
+    helper,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    class FakeXBrowser:
+        def navigate(self, url):
+            calls.append(("navigate", url))
+
+        def capture_attention(self):
+            calls.append("capture")
+
+    monkeypatch.setattr(helper, "x_current_user", lambda cdp: "other-handle")
+    result = helper.inspect_x(
+        {
+            "type": "x",
+            "login": "assigned-handle",
+            "password": "must-not-leak",
+            "is_active": True,
+        },
+        cdp=FakeXBrowser(),
+    )
+
+    assert result == {
+        "status": "wrong_account",
+        "type": "x",
+        "login": "assigned-handle",
+        "error": "Chromium is authenticated as another X account",
+    }
+    assert calls == [("navigate", "https://x.com/home")]
+    assert "must-not-leak" not in json.dumps(result)
+
+
+def test_x_login_keeps_an_existing_captcha_or_2fa_screen_open(
+    helper,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manual_attention = {
+        "status": "manual_attention",
+        "type": "x",
+        "login": "assigned-handle",
+        "error": "X requires manual CAPTCHA completion",
+    }
+    monkeypatch.setattr(helper, "inspect_x", lambda account, *, cdp: manual_attention)
+
+    class FakeXBrowser:
+        def navigate(self, url):
+            pytest.fail(f"login flow must not replace the challenge page: {url}")
+
+    result = helper.login_x(
+        {
+            "type": "x",
+            "login": "assigned-handle",
+            "password": "must-not-leak",
+            "is_active": True,
+        },
+        cdp=FakeXBrowser(),
+    )
+
+    assert result == manual_attention
+    assert "must-not-leak" not in json.dumps(result)
+
+
 def test_reddit_login_fills_credentials_without_returning_password(
     helper,
     monkeypatch: pytest.MonkeyPatch,

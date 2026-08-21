@@ -6,13 +6,34 @@ browser_screen="${HERMES_BROWSER_SCREEN:-1440x900x24}"
 browser_profile="${HERMES_BROWSER_PROFILE_DIR:-/opt/data/browser-profile}"
 browser_state="${HERMES_BROWSER_STATE_DIR:-/opt/data/browser}"
 browser_proxy_args=()
+browser_network_mode="${HERMES_BROWSER_NETWORK_MODE:-}"
 
-if [[ "${HERMES_RESIDENTIAL_PROXY_ENABLED:-false}" == "true" ]]; then
-  browser_proxy_args=(
-    "--proxy-server=http://127.0.0.1:${HERMES_RESIDENTIAL_PROXY_PORT:-8899}"
-    "--proxy-bypass-list=<-loopback>"
-  )
+if [[ -z "${browser_network_mode}" ]]; then
+  if [[ "${HERMES_RESIDENTIAL_PROXY_ENABLED:-false}" == "true" ]]; then
+    browser_network_mode="assigned_proxy"
+  else
+    browser_network_mode="direct"
+  fi
 fi
+
+case "${browser_network_mode}" in
+  assigned_proxy)
+    if [[ "${HERMES_RESIDENTIAL_PROXY_ENABLED:-false}" != "true" ]]; then
+      echo "assigned_proxy browser mode requires HERMES_RESIDENTIAL_PROXY_ENABLED=true" >&2
+      exit 1
+    fi
+    browser_proxy_args=(
+      "--proxy-server=http://127.0.0.1:${HERMES_RESIDENTIAL_PROXY_PORT:-8899}"
+      "--proxy-bypass-list=<-loopback>"
+    )
+    ;;
+  direct)
+    ;;
+  *)
+    echo "HERMES_BROWSER_NETWORK_MODE must be assigned_proxy or direct" >&2
+    exit 1
+    ;;
+esac
 
 mkdir -p "${browser_profile}" "${browser_state}"
 chmod 0700 "${browser_profile}"
