@@ -1,9 +1,10 @@
 """Hardened x-use 2.4.1 adapter for the Hermes runtime.
 
 The upstream package supplies the X scraping and publishing engine. This
-adapter narrows it to a fixed MCP allowlist, forces draft-only writes, attaches
-Selenium to a dedicated tab in the existing persistent Chromium instance, and
-keeps dashboard approval completely outside the MCP surface.
+adapter narrows it to a fixed MCP allowlist, forces text writes through local
+drafts, attaches Selenium to a dedicated tab in the existing persistent
+Chromium instance, and keeps dashboard approval completely outside the MCP
+surface.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 
 from xuse import __version__ as upstream_version
 from xuse.core.config_loader import ConfigLoader
+from xuse.features.engagement import TweetEngagement
 from xuse.features.scraper import TweetScraper
 from xuse.mcp import actions
 from xuse.mcp.annotations import (
@@ -80,6 +82,7 @@ MCP_ALLOWED_TOOLS = frozenset(
         "search_profile",
         "get_tweet",
         "prepare_reply",
+        "like_tweet",
         "post_tweet",
         "reply_to_tweet",
         "list_drafts",
@@ -87,6 +90,7 @@ MCP_ALLOWED_TOOLS = frozenset(
         "reject_draft",
     }
 )
+MCP_LOCAL_TOOLS = frozenset({"like_tweet"})
 MCP_FORBIDDEN_TOOLS = frozenset(
     {
         "approve_draft",
@@ -1103,6 +1107,60 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
         )
         return _draft_envelope(draft)
 
+    @server.tool(name="like_tweet", annotations=PUBLISHES_TO_X)
+    @guard
+    async def safe_like_tweet(account: str, tweet_url: str) -> dict[str, Any]:
+        """Like one canonical X status URL from the assigned verified account."""
+
+        from xuse.mcp import executor as ex
+
+        account_id, raw, model = ex.resolve_account(ctx, account)
+        ex.require_active(raw, account_id)
+        try:
+            canonical_url, tweet_id = canonical_x_status_url(tweet_url)
+        except ValueError:
+            raise ToolError("Like target must be an https://x.com tweet URL.")
+        dedup_key = f"like_{account_id}_{tweet_id}"
+        if ex.is_processed(ctx, dedup_key):
+            return ok_(
+                account=account_id,
+                action="like_tweet",
+                tweet_id=tweet_id,
+                tweet_url=canonical_url,
+                success=True,
+                already_liked=True,
+            )
+
+        async with ctx.session_pool.session(account_id) as browser_manager:
+            await reserve_persistent_action_pacing(ctx, account_id)
+            engagement = TweetEngagement(browser_manager, model)
+            success = await engagement.like_tweet(
+                tweet_id=tweet_id,
+                tweet_url=canonical_url,
+            )
+        if success:
+            ex.mark_processed(ctx, dedup_key)
+        try:
+            metrics = ex.metrics_for(ctx, account_id)
+            metrics.log_event(
+                "like",
+                "success" if success else "failure",
+                {"tweet_id": tweet_id, "source": "mcp"},
+            )
+            metrics.increment("likes" if success else "errors")
+        except Exception:
+            pass
+        if not success:
+            raise ToolError(f"Like on tweet {tweet_id} failed.")
+        return ok_(
+            account=account_id,
+            action="like_tweet",
+            tweet_id=tweet_id,
+            tweet_url=canonical_url,
+            success=True,
+            already_liked=False,
+        )
+
     @server.tool(name="reply_to_tweet", annotations=PUBLISHES_TO_X)
     @guard
     async def safe_reply_to_tweet(
@@ -1160,8 +1218,9 @@ def create_safe_server():
     )
     tools = server._tool_manager  # FastMCP 1.x public manager has remove_tool().
     upstream_names = {item.name for item in tools.list_tools()}
-    if not MCP_ALLOWED_TOOLS.issubset(upstream_names):
-        missing = sorted(MCP_ALLOWED_TOOLS - upstream_names)
+    upstream_required = MCP_ALLOWED_TOOLS - MCP_LOCAL_TOOLS
+    if not upstream_required.issubset(upstream_names):
+        missing = sorted(upstream_required - upstream_names)
         raise RuntimeError(f"x-use MCP contract changed; missing tools: {missing}")
     for name in list(upstream_names):
         if name not in MCP_ALLOWED_TOOLS or name in {
@@ -1173,6 +1232,7 @@ def create_safe_server():
             "search_profile",
             "get_tweet",
             "prepare_reply",
+            "like_tweet",
             "post_tweet",
             "reply_to_tweet",
             "reject_draft",
@@ -1189,9 +1249,9 @@ def create_safe_server():
     server._resource_manager._templates.clear()
     try:
         server._mcp_server.instructions = (
-            "Read X through the assigned verified account. post_tweet and "
-            "reply_to_tweet create dashboard-reviewed drafts only; this MCP "
-            "has no publishing or queue-execution gate."
+            "Read X and like individual tweets through the assigned verified "
+            "account. post_tweet and reply_to_tweet create dashboard-reviewed "
+            "drafts only; this MCP has no queue-execution gate."
         )
     except Exception:
         pass

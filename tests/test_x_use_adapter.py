@@ -422,6 +422,116 @@ def test_stage_tools_persist_only_canonical_execution_payloads(adapter) -> None:
     asyncio.run(adapter.shutdown_safe_server(server))
 
 
+def test_like_tweet_executes_one_canonical_verified_like(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str, str]] = []
+    sessions: list[str] = []
+    pacing: list[str] = []
+    store = adapter.LockedBoundedDraftStore(
+        adapter.X_USE_DATA_DIR / "drafts" / "drafts.jsonl"
+    )
+    monkeypatch.setattr(adapter, "draft_store", lambda: store)
+
+    class FakePool:
+        idle_timeout_seconds = 600
+
+        def find_account_dict(self, account: str):
+            return {"account_id": account, "is_active": True}
+
+        @asynccontextmanager
+        async def session(self, account: str):
+            sessions.append(account)
+            yield object()
+
+        async def close_all(self):
+            return None
+
+    class FakeEngagement:
+        def __init__(self, browser_manager, model):
+            self.browser_manager = browser_manager
+            self.model = model
+
+        async def like_tweet(self, tweet_id: str, tweet_url: str) -> bool:
+            calls.append((self.model.account_id, tweet_id, tweet_url))
+            return True
+
+    async def fake_pacing(ctx, account: str):
+        pacing.append(account)
+
+    monkeypatch.setattr(adapter, "session_pool", lambda loader: FakePool())
+    monkeypatch.setattr(adapter, "TweetEngagement", FakeEngagement)
+    monkeypatch.setattr(adapter, "reserve_persistent_action_pacing", fake_pacing)
+    server = adapter.create_safe_server()
+
+    first = call_tool(
+        server,
+        "like_tweet",
+        {
+            "account": "expected_user",
+            "tweet_url": "https://Twitter.com/Some_User/status/123?utm=1",
+        },
+    )
+    second = call_tool(
+        server,
+        "like_tweet",
+        {
+            "account": "expected_user",
+            "tweet_url": "https://x.com/some_user/status/123",
+        },
+    )
+
+    assert first == {
+        "ok": True,
+        "account": "expected_user",
+        "action": "like_tweet",
+        "tweet_id": "123",
+        "tweet_url": "https://x.com/some_user/status/123",
+        "success": True,
+        "already_liked": False,
+    }
+    assert second["ok"] is True
+    assert second["already_liked"] is True
+    assert calls == [
+        ("expected_user", "123", "https://x.com/some_user/status/123")
+    ]
+    assert sessions == ["expected_user"]
+    assert pacing == ["expected_user"]
+    assert store.list() == []
+    asyncio.run(adapter.shutdown_safe_server(server))
+
+
+def test_like_tweet_rejects_noncanonical_targets_without_touching_browser(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakePool:
+        idle_timeout_seconds = 600
+
+        def find_account_dict(self, account: str):
+            return {"account_id": account, "is_active": True}
+
+        @asynccontextmanager
+        async def session(self, account: str):
+            raise AssertionError("invalid like target must not open a browser")
+            yield object()
+
+        async def close_all(self):
+            return None
+
+    monkeypatch.setattr(adapter, "session_pool", lambda loader: FakePool())
+    server = adapter.create_safe_server()
+
+    result = call_tool(
+        server,
+        "like_tweet",
+        {"account": "expected_user", "tweet_url": "https://example.com/status/123"},
+    )
+
+    assert result["ok"] is False
+    assert "https://x.com tweet URL" in result["error"]["message"]
+    asyncio.run(adapter.shutdown_safe_server(server))
+
+
 def test_mcp_draft_readers_revalidate_persistent_records_and_preview(adapter) -> None:
     server = adapter.create_safe_server()
     store = server.xuse_ctx.draft_store

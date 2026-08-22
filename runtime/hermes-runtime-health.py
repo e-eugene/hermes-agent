@@ -91,7 +91,7 @@ def x_use_preflight_ready() -> bool:
         return False
     return payload == {
         "commit": X_USE_COMMIT,
-        "tool_count": 13,
+        "tool_count": 14,
         "version": "2.4.1",
     }
 
@@ -108,7 +108,13 @@ def capabilities() -> list[str]:
         return base
     if not x_use_preflight_ready():
         return base
-    return ["x_use_mcp", "x_session_import", "x_draft_approval", *base]
+    return [
+        "x_use_mcp",
+        "x_session_import",
+        "x_draft_approval",
+        "x_like_tweet",
+        *base,
+    ]
 
 
 def safe_x_use_status(payload: object) -> dict[str, object]:

@@ -22,6 +22,7 @@ ALLOWED = {
     "search_profile",
     "get_tweet",
     "prepare_reply",
+    "like_tweet",
     "post_tweet",
     "reply_to_tweet",
     "list_drafts",
@@ -89,10 +90,13 @@ def main() -> None:
             raise RuntimeError("Hermes x_use MCP schema registration is incomplete")
         post = schemas[PREFIX + "post_tweet"]["parameters"]["properties"]
         reply = schemas[PREFIX + "reply_to_tweet"]["parameters"]["properties"]
+        like = schemas[PREFIX + "like_tweet"]["parameters"]["properties"]
         if set(post) != {"account", "text"}:
             raise RuntimeError("Hermes post_tweet schema is not draft-only")
         if set(reply) != {"account", "tweet_url", "text"}:
             raise RuntimeError("Hermes reply_to_tweet schema is not draft-only")
+        if set(like) != {"account", "tweet_url"}:
+            raise RuntimeError("Hermes like_tweet schema is invalid")
     finally:
         shutdown_mcp_servers()
     write_marker()

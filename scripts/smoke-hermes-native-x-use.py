@@ -21,6 +21,7 @@ ALLOWED = {
     "search_profile",
     "get_tweet",
     "prepare_reply",
+    "like_tweet",
     "post_tweet",
     "reply_to_tweet",
     "list_drafts",
@@ -97,10 +98,15 @@ def main() -> None:
         reply_properties = set(
             schemas[PREFIX + "reply_to_tweet"]["parameters"]["properties"]
         )
+        like_properties = set(
+            schemas[PREFIX + "like_tweet"]["parameters"]["properties"]
+        )
         if post_properties != {"account", "text"}:
             raise RuntimeError("Hermes post_tweet schema widened")
         if reply_properties != {"account", "tweet_url", "text"}:
             raise RuntimeError("Hermes reply_to_tweet schema widened")
+        if like_properties != {"account", "tweet_url"}:
+            raise RuntimeError("Hermes like_tweet schema invalid")
         print(
             json.dumps(
                 {

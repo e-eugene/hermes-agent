@@ -70,7 +70,7 @@ from pathlib import Path
 marker = json.loads(Path(\"/tmp/hermes-x-use/native-mcp-ready.json\").read_text())
 assert marker == {
     \"commit\": \"e57e215e45b3e68cbd8cd7c46799cd932c234eac\",
-    \"tool_count\": 13,
+    \"tool_count\": 14,
     \"version\": \"2.4.1\",
 }
 "

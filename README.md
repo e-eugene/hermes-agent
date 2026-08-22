@@ -61,9 +61,9 @@ The service on `8643` is private-only and requires `Authorization: Bearer
 - `GET /health` returns runtime readiness plus
   `capabilities: ["x_use_mcp", "x_session_import", "x_draft_approval",
   "persistent_browser_profile", "remote_chromium", "network_status"]`
-  and the last browser-network snapshot in `network`. The three x-use
+  and the last browser-network snapshot in `network`. The x-use
   capabilities appear only after installed Hermes has discovered exactly the
-  curated 13-tool MCP surface during startup.
+  curated 14-tool MCP surface during startup.
 - `GET /network/status` makes a one-off request from the actual headed Chromium
   CDP browser to a fixed public IP-echo endpoint. It returns only
   `{status: "healthy"|"unhealthy"|"unavailable", mode,

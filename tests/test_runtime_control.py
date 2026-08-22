@@ -31,7 +31,7 @@ def control(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         json.dumps(
             {
                 "commit": "e57e215e45b3e68cbd8cd7c46799cd932c234eac",
-                "tool_count": 13,
+                "tool_count": 14,
                 "version": "2.4.1",
             }
         )
@@ -52,6 +52,7 @@ def test_health_capabilities_and_network_snapshot_are_public_only(control) -> No
         "x_use_mcp",
         "x_session_import",
         "x_draft_approval",
+        "x_like_tweet",
         "persistent_browser_profile",
         "remote_chromium",
         "network_status",
@@ -91,7 +92,7 @@ def test_x_use_capabilities_require_exact_private_native_preflight_marker(
         json.dumps(
             {
                 "commit": control.X_USE_COMMIT,
-                "tool_count": 14,
+                "tool_count": 13,
                 "version": "2.4.1",
             }
         )
@@ -111,7 +112,7 @@ def test_x_use_preflight_marker_rejects_group_readable_or_symlink(
         json.dumps(
             {
                 "commit": control.X_USE_COMMIT,
-                "tool_count": 13,
+                "tool_count": 14,
                 "version": "2.4.1",
             }
         )

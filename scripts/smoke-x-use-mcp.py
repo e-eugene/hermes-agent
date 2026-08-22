@@ -20,6 +20,7 @@ ALLOWED = {
     "search_profile",
     "get_tweet",
     "prepare_reply",
+    "like_tweet",
     "post_tweet",
     "reply_to_tweet",
     "list_drafts",
