@@ -993,6 +993,61 @@ def test_crashed_owned_target_is_replaced_before_the_next_action(
     assert "verify" in calls
 
 
+def test_navigation_accepts_a_committed_page_after_a_transient_webdriver_error(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = "https://x.com/example/status/123"
+    calls: list[str] = []
+
+    class Driver:
+        current_url = target
+
+        def get(self, url):
+            calls.append(url)
+            raise adapter.WebDriverException("transient navigation failure")
+
+        def execute_script(self, script):
+            assert script == "return document.readyState"
+            return "complete"
+
+    manager = adapter.SafeAttachedBrowserManager.__new__(
+        adapter.SafeAttachedBrowserManager
+    )
+    driver = Driver()
+    monkeypatch.setattr(manager, "get_driver", lambda: driver)
+    monkeypatch.setattr(manager, "_switch_to_owned", lambda: None)
+
+    assert manager.navigate_to(target) is True
+    assert calls == [target]
+
+
+def test_navigation_retries_once_before_any_x_click(adapter, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = "https://x.com/example/status/123"
+    calls: list[str] = []
+
+    class Driver:
+        current_url = "chrome-error://chromewebdata/"
+
+        def get(self, url):
+            calls.append(url)
+            if len(calls) == 1:
+                raise adapter.WebDriverException("temporary navigation failure")
+            self.current_url = url
+
+        def execute_script(self, script):
+            return "complete"
+
+    manager = adapter.SafeAttachedBrowserManager.__new__(
+        adapter.SafeAttachedBrowserManager
+    )
+    driver = Driver()
+    monkeypatch.setattr(manager, "get_driver", lambda: driver)
+    monkeypatch.setattr(manager, "_switch_to_owned", lambda: None)
+
+    assert manager.navigate_to(target) is True
+    assert calls == [target, target]
+
+
 def test_teardown_closes_only_owned_tab_and_never_quits_browser(adapter) -> None:
     calls: list[object] = []
 

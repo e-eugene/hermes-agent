@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
+import logging
 import math
 import os
 import threading
@@ -126,6 +127,7 @@ CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
 # the same line as ``return`` so operation-time verification evaluates exactly
 # the same expression as the raw-CDP health probe.
 SELENIUM_IDENTITY_SCRIPT = f"return ({IDENTITY_EXPRESSION.strip()});"
+logger = logging.getLogger(__name__)
 
 
 class WrongAccountError(RuntimeError):
@@ -278,15 +280,44 @@ class SafeAttachedBrowserManager:
             return False
 
     def navigate_to(self, url: str, ensure_driver: bool = True) -> bool:
-        try:
-            driver = self.get_driver() if ensure_driver else self.driver
-            if driver is None:
-                return False
-            self._switch_to_owned()
-            driver.get(url)
-            return True
-        except Exception:
-            return False
+        """Navigate the owned target without treating a committed page as failure.
+
+        Chromium/WebDriver can report a transient navigation exception after the
+        renderer has already committed the destination. Retrying navigation is
+        safe because this method is used only before an X action; no click has
+        happened yet. A crashed renderer is handled by ``get_driver()`` on the
+        second attempt, which recreates only the owned target.
+        """
+
+        normalized_url = url.split("#", 1)[0].rstrip("/")
+        attempts = 2 if ensure_driver else 1
+        for attempt in range(attempts):
+            try:
+                driver = self.get_driver() if ensure_driver else self.driver
+                if driver is None:
+                    return False
+                self._switch_to_owned()
+                driver.get(url)
+                return True
+            except Exception as exc:
+                # Do not put the exception text or URL in logs: WebDriver
+                # errors can include page fragments. The exception class is
+                # sufficient for operational diagnosis and keeps logs secret
+                # safe.
+                logger.warning(
+                    "x-use owned navigation attempt %s/%s failed: %s",
+                    attempt + 1,
+                    attempts,
+                    type(exc).__name__,
+                )
+                try:
+                    current_url = str(driver.current_url).split("#", 1)[0].rstrip("/")
+                    ready_state = driver.execute_script("return document.readyState")
+                    if current_url == normalized_url and ready_state != "loading":
+                        return True
+                except Exception:
+                    pass
+        return False
 
     def ensure_expected_handle(self, timeout: float = 35) -> str:
         """Navigate only the owned target and fail closed on any mismatch."""
