@@ -52,7 +52,13 @@ def browser_network_mode() -> str:
 
 
 def capabilities() -> list[str]:
-    return ["x_social_account", "remote_chromium", "network_status"]
+    return [
+        "x_social_account",
+        "x_manual_auth",
+        "persistent_browser_profile",
+        "remote_chromium",
+        "network_status",
+    ]
 
 
 def healthy() -> bool:

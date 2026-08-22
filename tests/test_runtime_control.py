@@ -35,6 +35,8 @@ def test_health_capabilities_and_network_snapshot_are_public_only(control) -> No
 
     assert control.capabilities() == [
         "x_social_account",
+        "x_manual_auth",
+        "persistent_browser_profile",
         "remote_chromium",
         "network_status",
     ]

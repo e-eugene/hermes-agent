@@ -57,7 +57,8 @@ The service on `8643` is private-only and requires `Authorization: Bearer
 <API_SERVER_KEY>`. It exposes a small redacted contract for the dashboard:
 
 - `GET /health` returns runtime readiness plus
-  `capabilities: ["x_social_account", "remote_chromium", "network_status"]`
+  `capabilities: ["x_social_account", "x_manual_auth",
+  "persistent_browser_profile", "remote_chromium", "network_status"]`
   and the last browser-network snapshot in `network`.
 - `GET /network/status` makes a one-off request from the actual headed Chromium
   CDP browser to a fixed public IP-echo endpoint. It returns only
@@ -66,8 +67,11 @@ The service on `8643` is private-only and requires `Authorization: Bearer
 - `POST /social-accounts/x/status` and
   `POST /social-accounts/x/login` return the assigned handle and one of
   `authenticated`, `not_logged_in`, `wrong_account`, `manual_attention`, or a
-  redacted error. CAPTCHA, 2FA and an already signed-in different account are
-  never bypassed automatically.
+  redacted error. Login is an explicit manual handoff: the helper verifies the
+  current identity, then opens and focuses the persistent X login tab for the
+  operator in Remote Chromium. It never reads, fills, or submits the allocated
+  password. CAPTCHA, 2FA and an already signed-in different account are never
+  bypassed automatically.
 
 Remote Chromium connects through a single-controller, binary WebSocket bridge
 on `6081`. It forwards only to an `x11vnc` process bound to container loopback;
@@ -143,6 +147,9 @@ while in `assigned_proxy` mode.
 
 The `residential-proxy` command inside the container supports `status`, `url`,
 `sticky [session-id]`, and `rotate`. It never prints upstream credentials.
+Social-account status and login only verify that the selected browser route and
+local proxy bridge are ready. They never invoke these mutating proxy commands,
+so checking authentication cannot rotate the browser's sticky session.
 
 ### Social accounts
 
@@ -173,11 +180,29 @@ social-account login x
 ```
 
 The X helper uses the same persistent headed Chromium profile and selected
-browser network mode as Hermes Browser tools. It will fill the assigned login
-and password only into X's page. It never prints credentials, logs out a
-different account, clears cookies, or attempts to solve CAPTCHA/2FA. Those
-states return `manual_attention` or `wrong_account` and must be completed in
-Remote Chromium before retrying Status.
+browser network mode as Hermes Browser tools. `social-account login x` does not
+require or read a password. It checks the assigned identity in a separate
+temporary CDP target, closes that target without disturbing the operator's
+current page, and then opens or focuses an X login/challenge tab in the visible
+persistent browser. Existing non-auth X tabs are never navigated or replaced;
+if no login/challenge tab exists, the helper opens a new foreground tab at
+`https://x.com/i/flow/login`. The operator completes username, password,
+CAPTCHA, 2FA, or identity checks directly in Remote Chromium and then runs
+`social-account status x` again.
+
+`social-account status x` also performs its identity check in a separate
+temporary target and always closes it, so polling cannot replace an in-progress
+operator challenge. It waits for the hydrated X application and accepts only a
+strictly validated handle from X's authenticated profile navigation or account
+switcher. A login/onboarding page is positive evidence of a logged-out session;
+an unknown or incomplete page returns `manual_attention` instead of being
+misclassified as logged out. A successful session is stored in
+`/opt/data/browser-profile` and survives container restarts and image
+redeployments as long as the per-agent volume is preserved. X may still revoke
+cookies or require a later re-verification. The helper never logs out a
+different account, clears cookies, takes attention screenshots, or attempts to
+solve a challenge automatically; those states return `manual_attention` or
+`wrong_account` for operator resolution.
 
 ## Secret handling
 
