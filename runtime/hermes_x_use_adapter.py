@@ -118,6 +118,13 @@ MAX_SINGLE_TWEET_CANDIDATES = 20
 MAX_METRICS_FILE_BYTES = 256 * 1024
 CDP_DEBUGGER_ADDRESS = "127.0.0.1:9222"
 CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
+# ``IDENTITY_EXPRESSION`` is intentionally formatted as a readable multiline
+# expression and therefore starts with a newline.  Selenium executes scripts as
+# function bodies, where ``return\n...`` triggers JavaScript automatic semicolon
+# insertion and silently returns ``undefined``.  Keep the opening parenthesis on
+# the same line as ``return`` so operation-time verification evaluates exactly
+# the same expression as the raw-CDP health probe.
+SELENIUM_IDENTITY_SCRIPT = f"return ({IDENTITY_EXPRESSION.strip()});"
 
 
 class WrongAccountError(RuntimeError):
@@ -283,7 +290,7 @@ class SafeAttachedBrowserManager:
         while True:
             try:
                 snapshot = self.driver.execute_script(
-                    "return " + IDENTITY_EXPRESSION
+                    SELENIUM_IDENTITY_SCRIPT
                 )
             except Exception as exc:
                 if time.monotonic() >= deadline:

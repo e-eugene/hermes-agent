@@ -723,6 +723,9 @@ def test_wrong_handle_fails_closed_before_browser_action(adapter, monkeypatch) -
             assert self.current == "owned-tab"
 
         def execute_script(self, script):
+            assert script == adapter.SELENIUM_IDENTITY_SCRIPT
+            assert script.startswith("return (")
+            assert not script.startswith("return \n")
             return {
                 "url": "https://x.com/home",
                 "app_ready": True,

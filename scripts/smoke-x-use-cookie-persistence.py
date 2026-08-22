@@ -53,6 +53,7 @@ def main() -> None:
         validate_session_export,
     )
     from hermes_x_use_adapter import (
+        SELENIUM_IDENTITY_SCRIPT,
         SafeAttachedBrowserManager,
         runtime_config_loader,
     )
@@ -103,6 +104,10 @@ def main() -> None:
     )
     first_driver = manager.get_driver()
     first_owned_handle = str(manager._owned_handle)
+    identity_probe = first_driver.execute_script(SELENIUM_IDENTITY_SCRIPT)
+    assert isinstance(identity_probe, dict)
+    assert identity_probe.get("url") == "about:blank"
+    assert identity_probe.get("profile_href") == ""
     try:
         client.request("Browser.close", timeout=5)
     except Exception:
@@ -145,6 +150,7 @@ def main() -> None:
                 "status": "ok",
                 "chromium_restarted": old_pid != new_pid,
                 "warm_session_reattached": True,
+                "selenium_identity_expression_evaluated": True,
                 "persistent_required_cookie_names": sorted(
                     REQUIRED_SESSION_COOKIES & names
                 ),
