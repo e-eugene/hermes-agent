@@ -23,6 +23,7 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service as ChromeService
 
@@ -263,7 +264,16 @@ class SafeAttachedBrowserManager:
         if self.driver is None or self._owned_handle is None:
             return False
         try:
-            return self._owned_handle in set(self.driver.window_handles)
+            if self._owned_handle not in set(self.driver.window_handles):
+                return False
+            # A renderer can crash while Chrome keeps the window handle alive.
+            # Verify that our owned target still executes a trivial command;
+            # otherwise get_driver() must close only this transport/target and
+            # create a fresh target for the next operation.
+            self.driver.switch_to.window(self._owned_handle)
+            return self.driver.execute_script("return document.readyState") is not None
+        except WebDriverException:
+            return False
         except Exception:
             return False
 

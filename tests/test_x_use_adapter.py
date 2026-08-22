@@ -925,6 +925,74 @@ def test_warm_verified_session_reattaches_after_browser_restart(
     ]
 
 
+def test_crashed_owned_target_is_replaced_before_the_next_action(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[object] = []
+
+    class SwitchTo:
+        def __init__(self, driver):
+            self.driver = driver
+
+        def window(self, handle):
+            self.driver.current = handle
+            calls.append(("switch", handle))
+
+    class CrashedDriver:
+        window_handles = ["owned-tab"]
+
+        def __init__(self):
+            self.current = "owned-tab"
+            self.switch_to = SwitchTo(self)
+
+        def execute_script(self, script):
+            raise adapter.WebDriverException("tab crashed")
+
+        def close(self):
+            calls.append(("close", self.current))
+            self.window_handles.remove(self.current)
+
+    class FreshDriver:
+        window_handles = ["fresh-tab"]
+
+        def __init__(self):
+            self.current = "fresh-tab"
+            self.switch_to = SwitchTo(self)
+
+        def set_page_load_timeout(self, value):
+            calls.append(("page-timeout", value))
+
+        def set_script_timeout(self, value):
+            calls.append(("script-timeout", value))
+
+        def execute_script(self, script):
+            return "complete"
+
+    class OldService:
+        def stop(self):
+            calls.append("old-service-stop")
+
+    class NewService:
+        pass
+
+    manager = adapter.SafeAttachedBrowserManager.__new__(
+        adapter.SafeAttachedBrowserManager
+    )
+    manager.driver = CrashedDriver()
+    manager._service = OldService()
+    manager._owned_handle = "owned-tab"
+    manager.logged_in_handle = "expected_user"
+    monkeypatch.setattr(adapter, "ChromeService", lambda **kwargs: NewService())
+    monkeypatch.setattr(adapter.webdriver, "Chrome", lambda **kwargs: FreshDriver())
+    monkeypatch.setattr(manager, "_create_owned_target", lambda: "fresh-tab")
+    monkeypatch.setattr(manager, "ensure_expected_handle", lambda: calls.append("verify"))
+
+    assert manager.get_driver().current == "fresh-tab"
+    assert ("close", "owned-tab") in calls
+    assert "old-service-stop" in calls
+    assert "verify" in calls
+
+
 def test_teardown_closes_only_owned_tab_and_never_quits_browser(adapter) -> None:
     calls: list[object] = []
 
