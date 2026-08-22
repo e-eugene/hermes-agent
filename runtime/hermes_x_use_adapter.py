@@ -1,10 +1,10 @@
 """Hardened x-use 2.4.1 adapter for the Hermes runtime.
 
 The upstream package supplies the X scraping and publishing engine. This
-adapter narrows it to a fixed MCP allowlist, forces text writes through local
-drafts, attaches Selenium to a dedicated tab in the existing persistent
-Chromium instance, and keeps dashboard approval completely outside the MCP
-surface.
+adapter narrows it to a fixed MCP allowlist, stages text writes through local
+drafts by default, optionally allows administrator-enabled direct text writes,
+attaches Selenium to a dedicated tab in the existing persistent Chromium
+instance, and keeps dashboard approval completely outside the MCP surface.
 """
 
 from __future__ import annotations
@@ -811,6 +811,51 @@ def _draft_envelope(draft: Draft) -> dict[str, Any]:
     )
 
 
+def direct_posting_enabled() -> bool:
+    return os.environ.get("HERMES_X_DIRECT_POSTING_ENABLED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _direct_publish_envelope(
+    account_id: str,
+    action: str,
+    result: object,
+    *,
+    tweet_url: str | None = None,
+    tweet_id: str | None = None,
+) -> dict[str, Any]:
+    source = result if isinstance(result, dict) else {}
+    if source.get("success") is not True:
+        raise RuntimeError("x-use returned an invalid direct publish result")
+    account = normalize_handle(source.get("account"))
+    if account != account_id:
+        raise WrongAccountError(account_id, account)
+    if source.get("action") != action:
+        raise RuntimeError("x-use returned an invalid direct publish action")
+    payload: dict[str, Any] = {
+        "account": account,
+        "action": action,
+        "success": True,
+        "direct_posting": True,
+        "message": (
+            "Published directly because direct X posting is enabled for this "
+            "Hermes instance."
+        ),
+    }
+    if tweet_id is not None:
+        result_tweet_id = str(source.get("tweet_id") or "")
+        if result_tweet_id != tweet_id:
+            raise RuntimeError("x-use returned an invalid direct reply result")
+        payload["tweet_id"] = tweet_id
+    if tweet_url is not None:
+        payload["tweet_url"] = tweet_url
+    return ok_(**payload)
+
+
 def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
     @server.tool(name="get_metrics", annotations=READ_ONLY_LOCAL)
     @guard
@@ -1093,12 +1138,21 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
     @server.tool(name="post_tweet", annotations=PUBLISHES_TO_X)
     @guard
     async def safe_post_tweet(account: str, text: str) -> dict[str, Any]:
-        """Stage a text-only X post for dashboard review. Nothing is posted."""
+        """Stage or directly publish a text-only X post, depending on admin policy."""
 
         from xuse.mcp import executor as ex
 
-        account_id, _, _ = ex.resolve_account(ctx, account)
+        account_id, raw, _ = ex.resolve_account(ctx, account)
         exact_text = validate_staged_text(text)
+        if direct_posting_enabled():
+            ex.require_active(raw, account_id)
+            await reserve_persistent_action_pacing(ctx, account_id)
+            result = await actions.exec_post(ctx, account_id, text=exact_text)
+            return _direct_publish_envelope(
+                account_id,
+                "post_tweet",
+                result,
+            )
         draft = ctx.draft_store.create(
             account=account_id,
             action="post_tweet",
@@ -1168,16 +1222,33 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
         tweet_url: str,
         text: str,
     ) -> dict[str, Any]:
-        """Stage an explicit X reply for dashboard review. Nothing is posted."""
+        """Stage or directly publish an X reply, depending on admin policy."""
 
         from xuse.mcp import executor as ex
 
-        account_id, _, _ = ex.resolve_account(ctx, account)
+        account_id, raw, _ = ex.resolve_account(ctx, account)
         try:
             canonical_url, tweet_id = canonical_x_status_url(tweet_url)
         except ValueError:
             raise ToolError("Reply target must be an https://x.com tweet URL.")
         exact_text = validate_staged_text(text)
+        if direct_posting_enabled():
+            ex.require_active(raw, account_id)
+            await reserve_persistent_action_pacing(ctx, account_id)
+            result = await actions.exec_reply(
+                ctx,
+                account_id,
+                tweet_url=canonical_url,
+                reply_text=exact_text,
+                tweet_id=tweet_id,
+            )
+            return _direct_publish_envelope(
+                account_id,
+                "reply_to_tweet",
+                result,
+                tweet_url=canonical_url,
+                tweet_id=tweet_id,
+            )
         draft = ctx.draft_store.create(
             account=account_id,
             action="reply_to_tweet",
@@ -1251,7 +1322,7 @@ def create_safe_server():
         server._mcp_server.instructions = (
             "Read X and like individual tweets through the assigned verified "
             "account. post_tweet and reply_to_tweet create dashboard-reviewed "
-            "drafts only; this MCP has no queue-execution gate."
+            "drafts unless the administrator enabled HERMES_X_DIRECT_POSTING_ENABLED."
         )
     except Exception:
         pass

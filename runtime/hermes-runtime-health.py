@@ -108,13 +108,21 @@ def capabilities() -> list[str]:
         return base
     if not x_use_preflight_ready():
         return base
-    return [
+    features = [
         "x_use_mcp",
         "x_session_import",
         "x_draft_approval",
         "x_like_tweet",
         *base,
     ]
+    if os.environ.get("HERMES_X_DIRECT_POSTING_ENABLED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        features.insert(3, "x_direct_posting")
+    return features
 
 
 def safe_x_use_status(payload: object) -> dict[str, object]:

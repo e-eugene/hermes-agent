@@ -26,6 +26,7 @@ def adapter(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("HERMES_BROWSER_NETWORK_MODE", "assigned_proxy")
     monkeypatch.setenv("HERMES_RESIDENTIAL_PROXY_PORT", "8899")
     monkeypatch.setenv("RESIDENTIAL_PROXY_URL", "http://127.0.0.1:8899")
+    monkeypatch.delenv("HERMES_X_DIRECT_POSTING_ENABLED", raising=False)
     common = importlib.import_module("hermes_x_use_common")
     module = importlib.import_module("hermes_x_use_adapter")
     settings = tmp_path / "config" / "settings.json"
@@ -419,6 +420,111 @@ def test_stage_tools_persist_only_canonical_execution_payloads(adapter) -> None:
         "tweet_url": "https://x.com/some_user/status/123",
         "tweet_id": "123",
     }
+    asyncio.run(adapter.shutdown_safe_server(server))
+
+
+def test_direct_posting_mode_executes_post_without_creating_a_draft(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str]] = []
+    pacing: list[str] = []
+
+    async def fake_post(ctx, account_id: str, text: str, media=None, community=None):
+        calls.append((account_id, text))
+        return {"account": account_id, "action": "post_tweet", "success": True}
+
+    async def fake_pacing(ctx, account: str):
+        pacing.append(account)
+
+    monkeypatch.setenv("HERMES_X_DIRECT_POSTING_ENABLED", "true")
+    monkeypatch.setattr(adapter.actions, "exec_post", fake_post)
+    monkeypatch.setattr(adapter, "reserve_persistent_action_pacing", fake_pacing)
+    server = adapter.create_safe_server()
+
+    result = call_tool(
+        server,
+        "post_tweet",
+        {"account": "expected_user", "text": "publish now"},
+    )
+
+    assert result == {
+        "ok": True,
+        "account": "expected_user",
+        "action": "post_tweet",
+        "success": True,
+        "direct_posting": True,
+        "message": (
+            "Published directly because direct X posting is enabled for this "
+            "Hermes instance."
+        ),
+    }
+    assert calls == [("expected_user", "publish now")]
+    assert pacing == ["expected_user"]
+    assert server.xuse_ctx.draft_store.list() == []
+    asyncio.run(adapter.shutdown_safe_server(server))
+
+
+def test_direct_posting_mode_executes_reply_to_canonical_tweet(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str, str, str]] = []
+
+    async def fake_reply(
+        ctx,
+        account_id: str,
+        tweet_url: str,
+        reply_text: str,
+        tweet_id: str | None = None,
+        text_content: str = "",
+    ):
+        calls.append((account_id, tweet_url, reply_text, tweet_id or ""))
+        return {
+            "account": account_id,
+            "action": "reply_to_tweet",
+            "tweet_id": tweet_id,
+            "success": True,
+        }
+
+    async def fake_pacing(ctx, account: str):
+        return None
+
+    monkeypatch.setenv("HERMES_X_DIRECT_POSTING_ENABLED", "1")
+    monkeypatch.setattr(adapter.actions, "exec_reply", fake_reply)
+    monkeypatch.setattr(adapter, "reserve_persistent_action_pacing", fake_pacing)
+    server = adapter.create_safe_server()
+
+    result = call_tool(
+        server,
+        "reply_to_tweet",
+        {
+            "account": "expected_user",
+            "tweet_url": "https://Twitter.com/Some_User/status/123?utm=1",
+            "text": "direct reply",
+        },
+    )
+
+    assert result == {
+        "ok": True,
+        "account": "expected_user",
+        "action": "reply_to_tweet",
+        "success": True,
+        "direct_posting": True,
+        "message": (
+            "Published directly because direct X posting is enabled for this "
+            "Hermes instance."
+        ),
+        "tweet_id": "123",
+        "tweet_url": "https://x.com/some_user/status/123",
+    }
+    assert calls == [
+        (
+            "expected_user",
+            "https://x.com/some_user/status/123",
+            "direct reply",
+            "123",
+        )
+    ]
+    assert server.xuse_ctx.draft_store.list() == []
     asyncio.run(adapter.shutdown_safe_server(server))
 
 

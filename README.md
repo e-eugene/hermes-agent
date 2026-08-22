@@ -60,8 +60,10 @@ The service on `8643` is private-only and requires `Authorization: Bearer
 
 - `GET /health` returns runtime readiness plus
   `capabilities: ["x_use_mcp", "x_session_import", "x_draft_approval",
-  "persistent_browser_profile", "remote_chromium", "network_status"]`
-  and the last browser-network snapshot in `network`. The x-use
+  "x_like_tweet", "persistent_browser_profile", "remote_chromium",
+  "network_status"]` and the last browser-network snapshot in `network`.
+  When `HERMES_X_DIRECT_POSTING_ENABLED=true`, the capability list also
+  contains `x_direct_posting`. The x-use
   capabilities appear only after installed Hermes has discovered exactly the
   curated 14-tool MCP surface during startup.
 - `GET /network/status` makes a one-off request from the actual headed Chromium
@@ -189,10 +191,13 @@ The image pins x-use to commit
 `e57e215e45b3e68cbd8cd7c46799cd932c234eac` in an isolated virtualenv. The MCP
 server itself exposes only `list_accounts`, `get_account`,
 `get_account_health`, `get_metrics`, `search_tweets`, `search_profile`,
-`get_tweet`, `prepare_reply`, `post_tweet`, `reply_to_tweet`, `list_drafts`,
-`get_draft`, and `reject_draft`. Post and reply tools create text-only drafts
-of at most 270 characters; they cannot publish, approve, drain a queue, mutate
-accounts/proxies, or attach arbitrary media.
+`get_tweet`, `prepare_reply`, `like_tweet`, `post_tweet`, `reply_to_tweet`,
+`list_drafts`, `get_draft`, and `reject_draft`. By default, post and reply
+tools create text-only drafts of at most 270 characters; they cannot publish,
+approve, drain a queue, mutate accounts/proxies, or attach arbitrary media.
+If the dashboard sets `HERMES_X_DIRECT_POSTING_ENABLED=true` for one Hermes
+instance, `post_tweet` and `reply_to_tweet` publish immediately instead of
+creating drafts. `like_tweet` is always an immediate X write.
 
 Every x-use browser-backed read and write takes a cross-process action lock and
 re-verifies the authenticated handle against the allocation. Selenium creates

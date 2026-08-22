@@ -26,6 +26,7 @@ def control(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("HERMES_BROWSER_NETWORK_MODE", "assigned_proxy")
     monkeypatch.setenv("HERMES_RESIDENTIAL_PROXY_PORT", "8899")
     monkeypatch.setenv("RESIDENTIAL_PROXY_URL", "http://127.0.0.1:8899")
+    monkeypatch.delenv("HERMES_X_DIRECT_POSTING_ENABLED", raising=False)
     marker = tmp_path / "native-mcp-ready.json"
     marker.write_text(
         json.dumps(
@@ -62,6 +63,25 @@ def test_health_capabilities_and_network_snapshot_are_public_only(control) -> No
         "mode": "assigned_proxy",
         "exit_ip": "8.8.8.8",
     }
+
+
+def test_health_capabilities_include_direct_posting_only_when_enabled(
+    control, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert "x_direct_posting" not in control.capabilities()
+
+    monkeypatch.setenv("HERMES_X_DIRECT_POSTING_ENABLED", "true")
+
+    assert control.capabilities() == [
+        "x_use_mcp",
+        "x_session_import",
+        "x_draft_approval",
+        "x_direct_posting",
+        "x_like_tweet",
+        "persistent_browser_profile",
+        "remote_chromium",
+        "network_status",
+    ]
 
 
 def test_direct_runtime_does_not_advertise_x_use_capabilities(
