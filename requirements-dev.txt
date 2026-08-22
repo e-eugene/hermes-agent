@@ -1,3 +1,3 @@
+-r runtime/x-use-requirements.lock
 pytest==9.0.2
-websockets==16.1
-
+ruff==0.12.8

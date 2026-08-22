@@ -75,6 +75,12 @@ if [[ -z "${HERMES_BROWSER_NETWORK_MODE:-}" ]]; then
 fi
 export HERMES_BROWSER_NETWORK_MODE
 
+# Never inherit a platform/user proxy into x-use. Assigned mode explicitly
+# gives only the no-auth loopback bridge to the MCP child below; direct mode
+# gets no HTTP proxy at all.
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY \
+  http_proxy https_proxy all_proxy no_proxy
+
 case "${HERMES_BROWSER_NETWORK_MODE}" in
   assigned_proxy)
     if [[ "${HERMES_RESIDENTIAL_PROXY_ENABLED:-false}" != "true" ]]; then
@@ -115,8 +121,26 @@ case "${HERMES_BROWSER_NETWORK_MODE}" in
     ;;
 esac
 
-mkdir -p /opt/data/browser /opt/data/workspace /tmp/hermes-secrets
+mkdir -p \
+  /opt/data/browser \
+  /opt/data/workspace \
+  /opt/data/x-use/drafts \
+  /opt/data/x-use/media \
+  /opt/data/x-use/metrics/data \
+  /opt/data/x-use/metrics/logs \
+  /tmp/hermes-secrets \
+  /tmp/hermes-x-use/config
 chmod 0700 /tmp/hermes-secrets
+chmod 0700 \
+  /opt/data/x-use \
+  /opt/data/x-use/drafts \
+  /opt/data/x-use/media \
+  /opt/data/x-use/metrics \
+  /opt/data/x-use/metrics/data \
+  /opt/data/x-use/metrics/logs \
+  /tmp/hermes-x-use \
+  /tmp/hermes-x-use/config
+rm -f /tmp/hermes-x-use/native-mcp-ready.json
 
 /opt/hermes/.venv/bin/python -c '
 import json
@@ -171,6 +195,11 @@ if [[ "${HERMES_BROWSER_NETWORK_MODE}" == "assigned_proxy" ]]; then
     HERMES_RESIDENTIAL_PROXY_COUNTRY \
     HERMES_RESIDENTIAL_PROXY_CITY \
     HERMES_RESIDENTIAL_PROXY_STATE_PATH
+
+  # Generate one non-secret x-use account/config only after the no-auth
+  # loopback proxy bridge is ready. Session cookies are imported later through
+  # the private control API and are never written here.
+  /usr/local/bin/hermes-x-use-configure >/dev/null
 fi
 
 /usr/local/bin/hermes-browser-supervisor >>/opt/data/browser/supervisor.log 2>&1 &
@@ -223,19 +252,94 @@ fi
 /opt/hermes/.venv/bin/python -c '
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 import yaml
 
 path = Path("/opt/data/config.yaml")
 config = yaml.safe_load(path.read_text()) or {}
-config.setdefault("platform_toolsets", {})["api_server"] = ["terminal", "browser"]
+config.setdefault("platform_toolsets", {})["api_server"] = [
+    "terminal",
+    "browser",
+    "x_use",
+]
 browser = config.setdefault("browser", {})
 browser["headed"] = True
 browser["cdp_url"] = "http://127.0.0.1:9222"
+allowed_x_use_tools = [
+    "list_accounts",
+    "get_account",
+    "get_account_health",
+    "get_metrics",
+    "search_tweets",
+    "search_profile",
+    "get_tweet",
+    "prepare_reply",
+    "post_tweet",
+    "reply_to_tweet",
+    "list_drafts",
+    "get_draft",
+    "reject_draft",
+]
+mcp_env = {
+    "NO_PROXY": "127.0.0.1,localhost,::1",
+    "no_proxy": "127.0.0.1,localhost,::1",
+}
+proxy_url = os.environ.get("RESIDENTIAL_PROXY_URL")
+network_mode = os.environ.get("HERMES_BROWSER_NETWORK_MODE")
+if network_mode == "assigned_proxy":
+    if not proxy_url:
+        raise SystemExit("x-use requires the no-auth loopback proxy bridge")
+    parsed_proxy = urlsplit(proxy_url)
+    if (
+        parsed_proxy.scheme != "http"
+        or parsed_proxy.hostname != "127.0.0.1"
+        or parsed_proxy.port is None
+        or parsed_proxy.username is not None
+        or parsed_proxy.password is not None
+        or parsed_proxy.path not in {"", "/"}
+        or parsed_proxy.query
+        or parsed_proxy.fragment
+    ):
+        raise SystemExit("RESIDENTIAL_PROXY_URL must be a no-auth loopback URL")
+    mcp_env.update({
+        "HERMES_BROWSER_NETWORK_MODE": "assigned_proxy",
+        "HERMES_RESIDENTIAL_PROXY_PORT": str(parsed_proxy.port),
+        "RESIDENTIAL_PROXY_URL": proxy_url,
+        "HTTP_PROXY": proxy_url,
+        "HTTPS_PROXY": proxy_url,
+        "http_proxy": proxy_url,
+        "https_proxy": proxy_url,
+    })
+mcp_servers = config.setdefault("mcp_servers", {})
+if network_mode == "assigned_proxy":
+    mcp_servers["x_use"] = {
+        "command": "/usr/local/bin/hermes-x-use-mcp",
+        "args": [],
+        "env": mcp_env,
+        "connect_timeout": 90,
+        "timeout": 150,
+        "tools": {
+            "include": allowed_x_use_tools,
+            "prompts": False,
+            "resources": False,
+        },
+    }
+else:
+    # Config is persistent: remove a stale x-use server after a deployment is
+    # explicitly switched to direct mode.
+    mcp_servers.pop("x_use", None)
 temporary = path.with_suffix(".yaml.tmp")
 temporary.write_text(yaml.safe_dump(config, sort_keys=False))
 os.chmod(temporary, 0o600)
 os.replace(temporary, path)
 '
+
+if [[ "${HERMES_BROWSER_NETWORK_MODE}" == "assigned_proxy" ]]; then
+  # Exercise installed Hermes discovery, then expose readiness only after it
+  # sees exactly the curated x-use schemas and shuts the MCP child down.
+  /usr/local/bin/hermes-x-use-native-preflight \
+    >>/opt/data/browser/x-use-native-preflight.log 2>&1
+fi
 
 HERMES_TUI_WS_ORPHAN_REAP_GRACE_S="${HERMES_TUI_WS_ORPHAN_REAP_GRACE_SECONDS}" \
   "${hermes}" serve --host 127.0.0.1 --port "${HERMES_TUI_PORT}" --skip-build \

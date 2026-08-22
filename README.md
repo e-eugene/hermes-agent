@@ -3,11 +3,10 @@
 Public container image for running an isolated
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) with headed
 Chromium, authenticated private service endpoints, optional residential proxy
-support, and runtime-provided social-account credentials.
+support, and a dashboard-reviewed x-use integration for one assigned X account.
 
 The image contains runtime code only. It does not contain an admin application,
-deployment credentials, LLM keys, proxy credentials, or social-account
-credentials.
+deployment credentials, LLM keys, proxy credentials, or X session cookies.
 
 ## Image
 
@@ -31,7 +30,10 @@ make a new container package public.
   a dedicated volume for each agent.
 - `/opt/data/browser-profile` stores the persistent Chromium profile.
 - `/tmp/hermes-secrets/social-accounts.json` is recreated on each start with
-  mode `0600`; the containing directory has mode `0700`.
+  mode `0600`; it contains only the allocated X handle, never X credentials or
+  cookies.
+- `/opt/data/x-use` stores bounded drafts and metrics. X cookies live only in
+  the persistent Chromium profile at `/opt/data/browser-profile`.
 - Chromium CDP listens only on loopback port `9222` inside the container.
 
 The image exposes these private-network ports:
@@ -39,7 +41,7 @@ The image exposes these private-network ports:
 | Port | Purpose | Authentication |
 | --- | --- | --- |
 | `8642` | Hermes API server | `Authorization: Bearer <API_SERVER_KEY>` |
-| `8643` | Runtime control: readiness, X account status/login, browser network status | `Authorization: Bearer <API_SERVER_KEY>` |
+| `8643` | Runtime control: readiness, x-use session/draft approval, browser network status | `Authorization: Bearer <API_SERVER_KEY>` |
 | `6081` | Binary WebSocket bridge to the loopback Remote Chromium VNC server | `Authorization: Bearer <API_SERVER_KEY>` |
 | `9120` | Dual-stack Hermes TUI and WebSocket bridge | Hermes bearer/session token |
 
@@ -57,21 +59,30 @@ The service on `8643` is private-only and requires `Authorization: Bearer
 <API_SERVER_KEY>`. It exposes a small redacted contract for the dashboard:
 
 - `GET /health` returns runtime readiness plus
-  `capabilities: ["x_social_account", "x_manual_auth",
+  `capabilities: ["x_use_mcp", "x_session_import", "x_draft_approval",
   "persistent_browser_profile", "remote_chromium", "network_status"]`
-  and the last browser-network snapshot in `network`.
+  and the last browser-network snapshot in `network`. The three x-use
+  capabilities appear only after installed Hermes has discovered exactly the
+  curated 13-tool MCP surface during startup.
 - `GET /network/status` makes a one-off request from the actual headed Chromium
   CDP browser to a fixed public IP-echo endpoint. It returns only
   `{status: "healthy"|"unhealthy"|"unavailable", mode,
   exit_ip?, error?}`; no proxy configuration is exposed.
-- `POST /social-accounts/x/status` and
-  `POST /social-accounts/x/login` return the assigned handle and one of
-  `authenticated`, `not_logged_in`, `wrong_account`, `manual_attention`, or a
-  redacted error. Login is an explicit manual handoff: the helper verifies the
-  current identity, then opens and focuses the persistent X login tab for the
-  operator in Remote Chromium. It never reads, fills, or submits the allocated
-  password. CAPTCHA, 2FA and an already signed-in different account are never
-  bypassed automatically.
+- `GET /x-use/status` returns a live `ready`, `not_configured`,
+  `wrong_account`, or `error` snapshot. Valid account states return HTTP 200;
+  the body carries the state.
+- `PUT /x-use/session` accepts one browser-cookie JSON export, up to 512 KiB.
+  Required `auth_token` and `ct0` cookies must be non-empty, scoped to x.com or
+  twitter.com, and have a finite future expiration. The upload replaces old X
+  cookies directly through loopback CDP, is discarded immediately, and is
+  never written to a cookie file, logged, or echoed.
+- `GET /x-use/drafts` lists bounded local drafts. `POST
+  /x-use/drafts/{draft_id}/approve` executes exactly one pending draft after a
+  fresh strict handle check; `/reject` permanently rejects it. These dashboard
+  routes are the only approval path for drafts created through x-use and are
+  not exposed by MCP. Ordinary Hermes terminal and browser tools remain
+  available for general agent work; they are outside this x-use draft approval
+  boundary and should be governed by the operator's normal Hermes policy.
 
 Remote Chromium connects through a single-controller, binary WebSocket bridge
 on `6081`. It forwards only to an `x11vnc` process bound to container loopback;
@@ -141,68 +152,55 @@ proxy account format.
 
 `HERMES_BROWSER_NETWORK_MODE=direct` is an explicit operational choice. The
 entrypoint removes all inherited proxy variables before child processes start,
-so Chromium, browser tools, Remote Chromium and social-account actions are all
-visibly direct for that deployment. There is no request-level direct fallback
-while in `assigned_proxy` mode.
+so Chromium, browser tools and Remote Chromium are visibly direct for that
+deployment. x-use is disabled in direct mode. There is no request-level direct
+fallback while in `assigned_proxy` mode.
 
 The `residential-proxy` command inside the container supports `status`, `url`,
 `sticky [session-id]`, and `rotate`. It never prints upstream credentials.
-Social-account status and login only verify that the selected browser route and
-local proxy bridge are ready. They never invoke these mutating proxy commands,
-so checking authentication cannot rotate the browser's sticky session.
+x-use attaches to the existing Chromium instance and therefore inherits the
+same no-auth loopback proxy bridge; upstream proxy credentials are never passed
+to Selenium or x-use. In `direct` mode the x-use MCP server is removed from the
+persistent Hermes config, its capabilities are not advertised, and its control
+API/browser adapter fail before CDP access.
 
-### Social accounts
+### x-use account and approval boundary
 
-`HERMES_SOCIAL_ACCOUNTS_JSON` accepts an array such as:
+`HERMES_SOCIAL_ACCOUNTS_JSON` must allocate exactly one active X handle:
 
 ```json
 [
   {
     "id": "account-id",
-    "type": "reddit",
-    "login": "runtime-login",
-    "password": "runtime-password",
+    "type": "x",
+    "login": "allocated_handle",
     "is_active": true
   }
 ]
 ```
 
-This is a runtime interface example only; never commit real values. On startup,
-the entrypoint writes the array to the configured temporary path, applies mode
-`0600`, atomically replaces any old file, and unsets the JSON variable in the
-entrypoint process. The `social-account` command exposes only redacted status.
-It supports existing Reddit login plus X commands used by Hermes and the
-dashboard:
+This is a runtime interface example only. On startup, the entrypoint writes the
+array to the configured temporary path, applies mode `0600`, atomically
+replaces any old file, and unsets the JSON variable. It generates one ephemeral
+x-use account configuration whose account id is the normalized allocated
+handle. Zero, multiple, inactive, or malformed allocations fail closed.
 
-```sh
-social-account status x
-social-account login x
-```
+The image pins x-use to commit
+`e57e215e45b3e68cbd8cd7c46799cd932c234eac` in an isolated virtualenv. The MCP
+server itself exposes only `list_accounts`, `get_account`,
+`get_account_health`, `get_metrics`, `search_tweets`, `search_profile`,
+`get_tweet`, `prepare_reply`, `post_tweet`, `reply_to_tweet`, `list_drafts`,
+`get_draft`, and `reject_draft`. Post and reply tools create text-only drafts
+of at most 270 characters; they cannot publish, approve, drain a queue, mutate
+accounts/proxies, or attach arbitrary media.
 
-The X helper uses the same persistent headed Chromium profile and selected
-browser network mode as Hermes Browser tools. `social-account login x` does not
-require or read a password. It checks the assigned identity in a separate
-temporary CDP target, closes that target without disturbing the operator's
-current page, and then opens or focuses an X login/challenge tab in the visible
-persistent browser. Existing non-auth X tabs are never navigated or replaced;
-if no login/challenge tab exists, the helper opens a new foreground tab at
-`https://x.com/i/flow/login`. The operator completes username, password,
-CAPTCHA, 2FA, or identity checks directly in Remote Chromium and then runs
-`social-account status x` again.
-
-`social-account status x` also performs its identity check in a separate
-temporary target and always closes it, so polling cannot replace an in-progress
-operator challenge. It waits for the hydrated X application and accepts only a
-strictly validated handle from X's authenticated profile navigation or account
-switcher. A login/onboarding page is positive evidence of a logged-out session;
-an unknown or incomplete page returns `manual_attention` instead of being
-misclassified as logged out. A successful session is stored in
-`/opt/data/browser-profile` and survives container restarts and image
-redeployments as long as the per-agent volume is preserved. X may still revoke
-cookies or require a later re-verification. The helper never logs out a
-different account, clears cookies, takes attention screenshots, or attempts to
-solve a challenge automatically; those states return `manual_attention` or
-`wrong_account` for operator resolution.
+Every x-use browser-backed read and write takes a cross-process action lock and
+re-verifies the authenticated handle against the allocation. Selenium creates
+one background CDP target for x-use and closes only that target and its own
+chromedriver transport; it never quits persistent Chromium or navigates an
+operator tab. The session persists across restarts only while its finite-lived
+cookies remain valid in the mounted Chromium profile. X can revoke a session
+or require re-verification at any time.
 
 ## Secret handling
 
@@ -223,19 +221,13 @@ Build locally from the repository root:
 docker build -t hermes-agent:local .
 ```
 
-Override the upstream Hermes version only when intentionally testing an update:
-
-```sh
-docker build \
-  --build-arg HERMES_BASE_IMAGE=nousresearch/hermes-agent:v2026.7.20 \
-  -t hermes-agent:local .
-```
-
 Run the helper and repository checks:
 
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/pip install --no-deps --no-build-isolation \
+  "x-use-mcp @ git+https://github.com/ihuzaifashoukat/x-use.git@e57e215e45b3e68cbd8cd7c46799cd932c234eac"
 .venv/bin/pytest
 bash -n runtime/*.sh
 python3 scripts/check-repository.py

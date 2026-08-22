@@ -18,15 +18,21 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements-dev.txt
+          cache-dependency-path: |
+            requirements-dev.txt
+            runtime/x-use-requirements.lock
       - name: Install test dependencies
-        run: python -m pip install -r requirements-dev.txt
+        run: |
+          python -m pip install -r requirements-dev.txt
+          python -m pip install --no-deps --no-build-isolation "x-use-mcp @ git+https://github.com/ihuzaifashoukat/x-use.git@e57e215e45b3e68cbd8cd7c46799cd932c234eac"
       - name: Check repository contents
         run: python scripts/check-repository.py
       - name: Check shell syntax
         run: bash -n runtime/*.sh
       - name: Check Python syntax
         run: python -m compileall -q runtime tests scripts
+      - name: Lint runtime and tests
+        run: python -m ruff check runtime tests scripts
       - name: Run tests
         run: python -m pytest
 
@@ -41,6 +47,9 @@ jobs:
           context: .
           file: Dockerfile
           push: false
+          load: true
           tags: hermes-agent:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Run x-use container smoke
+        run: scripts/smoke-x-use-container.sh hermes-agent:ci

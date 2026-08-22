@@ -11,7 +11,6 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
-import sys
 import time
 import urllib.request
 from typing import Any
