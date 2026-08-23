@@ -48,7 +48,8 @@ _CREDENTIAL_PATTERNS = (
 )
 _URL_CANDIDATE_RE = re.compile(r"(?i)\bhttps?://[^\s<>\"']+")
 _X_STATUS_PATH_RE = re.compile(
-    r"^/([A-Za-z0-9_]{1,15})/status/([1-9][0-9]{0,24})/?$"
+    r"^/(?:i(?:/web)?|(?P<handle>[A-Za-z0-9_]{1,15}))/status/"
+    r"(?P<tweet_id>[1-9][0-9]{0,24})/?$"
 )
 
 SOCIAL_ACCOUNTS_PATH = Path(
@@ -199,9 +200,11 @@ def canonical_x_status_url(value: object) -> tuple[str, str]:
     match = _X_STATUS_PATH_RE.fullmatch(parsed.path)
     if match is None:
         raise ValueError("X status URL is invalid")
-    handle = normalize_handle(match.group(1))
-    tweet_id = match.group(2)
-    return f"https://x.com/{handle}/status/{tweet_id}", tweet_id
+    tweet_id = match.group("tweet_id")
+    handle = match.group("handle")
+    if handle is None:
+        return f"https://x.com/i/web/status/{tweet_id}", tweet_id
+    return f"https://x.com/{normalize_handle(handle)}/status/{tweet_id}", tweet_id
 
 
 def load_expected_handle(path: Path | None = None) -> str:

@@ -55,6 +55,7 @@ from hermes_x_use_common import (
     X_USE_DATA_DIR,
     X_USE_SETTINGS_PATH,
     X_USE_VERSION,
+    RuntimeConfigurationError,
     acquire_browser_action_lock,
     canonical_x_status_url,
     configure_runtime,
@@ -128,6 +129,20 @@ CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
 # the same expression as the raw-CDP health probe.
 SELENIUM_IDENTITY_SCRIPT = f"return ({IDENTITY_EXPRESSION.strip()});"
 logger = logging.getLogger(__name__)
+
+
+def resolve_runtime_account(ctx: Ctx, account: str | None):
+    """Resolve the assigned runtime account with Hermes-friendly inputs."""
+
+    from xuse.mcp import executor as ex
+
+    if account is None or not str(account).strip():
+        return ex.resolve_account(ctx, None)
+    try:
+        normalized = normalize_handle(account)
+    except RuntimeConfigurationError:
+        raise ToolError("Requested X account is invalid.") from None
+    return ex.resolve_account(ctx, normalized)
 
 
 class WrongAccountError(RuntimeError):
@@ -1015,10 +1030,9 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
     ) -> dict[str, Any]:
         """Search X through the assigned verified account with bounded input."""
 
-        from xuse.mcp import executor as ex
         from xuse.mcp.tools import attach_search_images, dump_tweet
 
-        account_id, _, _ = ex.resolve_account(ctx, account)
+        account_id, _, _ = resolve_runtime_account(ctx, account)
         exact_query = validate_search_query(keywords)
         exact_limit = max(1, min(int(limit), 50))
         async with ctx.session_pool.session(account_id) as browser_manager:
@@ -1055,7 +1069,7 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
 
         if not isinstance(profile, str) or has_credential_like_content(profile):
             raise ToolError("Profile target is invalid.")
-        account_id, _, _ = ex.resolve_account(ctx, account)
+        account_id, _, _ = resolve_runtime_account(ctx, account)
         handle = ex.profile_handle_from(profile)
         profile_url = f"https://x.com/{handle.lower()}"
         exact_limit = max(1, min(int(limit), 50))
@@ -1080,13 +1094,12 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
         return await attach_search_images(envelope, tweets)
 
     async def safe_single_tweet(
-        account: str,
+        account: str | None,
         tweet_url: str,
     ) -> tuple[str, Any, str, str, Any]:
         """Resolve an account and fetch only a canonical public X status URL."""
 
-        from xuse.mcp import executor as ex
-        account_id, _, model = ex.resolve_account(ctx, account)
+        account_id, _, model = resolve_runtime_account(ctx, account)
         try:
             canonical_url, tweet_id = canonical_x_status_url(tweet_url)
         except ValueError:
@@ -1118,8 +1131,8 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
     @server.tool(name="get_tweet", annotations=READ_ONLY_FROM_X)
     @guard
     async def safe_get_tweet(
-        account: str,
         tweet_url: str,
+        account: str | None = None,
         include_images: bool = True,
     ) -> dict[str, Any]:
         """Fetch one tweet after replacing caller input with its canonical X URL."""
@@ -1149,8 +1162,8 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
     @server.tool(name="prepare_reply", annotations=READ_ONLY_FROM_X)
     @guard
     async def safe_prepare_reply(
-        account: str,
         tweet_url: str,
+        account: str | None = None,
         include_images: bool = True,
     ) -> dict[str, Any]:
         """Prepare reply context for one canonical X status URL only."""
@@ -1185,12 +1198,12 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
 
     @server.tool(name="post_tweet", annotations=PUBLISHES_TO_X)
     @guard
-    async def safe_post_tweet(account: str, text: str) -> dict[str, Any]:
+    async def safe_post_tweet(text: str, account: str | None = None) -> dict[str, Any]:
         """Stage or directly publish a text-only X post, depending on admin policy."""
 
         from xuse.mcp import executor as ex
 
-        account_id, raw, _ = ex.resolve_account(ctx, account)
+        account_id, raw, _ = resolve_runtime_account(ctx, account)
         exact_text = validate_staged_text(text)
         if direct_posting_enabled():
             ex.require_active(raw, account_id)
@@ -1211,12 +1224,14 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
 
     @server.tool(name="like_tweet", annotations=PUBLISHES_TO_X)
     @guard
-    async def safe_like_tweet(account: str, tweet_url: str) -> dict[str, Any]:
+    async def safe_like_tweet(
+        tweet_url: str, account: str | None = None
+    ) -> dict[str, Any]:
         """Like one canonical X status URL from the assigned verified account."""
 
         from xuse.mcp import executor as ex
 
-        account_id, raw, model = ex.resolve_account(ctx, account)
+        account_id, raw, model = resolve_runtime_account(ctx, account)
         ex.require_active(raw, account_id)
         try:
             canonical_url, tweet_id = canonical_x_status_url(tweet_url)
@@ -1266,15 +1281,15 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
     @server.tool(name="reply_to_tweet", annotations=PUBLISHES_TO_X)
     @guard
     async def safe_reply_to_tweet(
-        account: str,
         tweet_url: str,
         text: str,
+        account: str | None = None,
     ) -> dict[str, Any]:
         """Stage or directly publish an X reply, depending on admin policy."""
 
         from xuse.mcp import executor as ex
 
-        account_id, raw, _ = ex.resolve_account(ctx, account)
+        account_id, raw, _ = resolve_runtime_account(ctx, account)
         try:
             canonical_url, tweet_id = canonical_x_status_url(tweet_url)
         except ValueError:

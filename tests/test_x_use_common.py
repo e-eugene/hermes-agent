@@ -59,6 +59,14 @@ def valid_export() -> bytes:
             "https://Twitter.com/Some_User/status/123456789?utm_source=test#x",
             ("https://x.com/some_user/status/123456789", "123456789"),
         ),
+        (
+            "https://x.com/i/web/status/123456789",
+            ("https://x.com/i/web/status/123456789", "123456789"),
+        ),
+        (
+            "https://twitter.com/i/status/123456789",
+            ("https://x.com/i/web/status/123456789", "123456789"),
+        ),
         ("https://x.com/user/status/0", None),
         ("https://user:pass@x.com/user/status/123", None),
         ("https://example.com/user/status/123", None),

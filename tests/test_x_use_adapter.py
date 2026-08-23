@@ -248,15 +248,15 @@ def test_single_tweet_tools_navigate_only_to_canonical_x_url(
         server,
         tool_name,
         {
-            "account": "expected_user",
-            "tweet_url": "https://Twitter.com/Some_User/status/123?tracking=yes",
+            "account": "@Expected_User",
+            "tweet_url": "https://x.com/i/web/status/123",
             "include_images": False,
         },
     )
 
     assert result["ok"] is True
-    assert result["tweet_url"] == "https://x.com/some_user/status/123"
-    assert calls == [("https://x.com/some_user/status/123", "123")]
+    assert result["tweet_url"] == "https://x.com/i/web/status/123"
+    assert calls == [("https://x.com/i/web/status/123", "123")]
     asyncio.run(adapter.shutdown_safe_server(server))
 
 
@@ -497,8 +497,7 @@ def test_direct_posting_mode_executes_reply_to_canonical_tweet(
         server,
         "reply_to_tweet",
         {
-            "account": "expected_user",
-            "tweet_url": "https://Twitter.com/Some_User/status/123?utm=1",
+            "tweet_url": "https://x.com/i/web/status/123",
             "text": "direct reply",
         },
     )
@@ -514,12 +513,12 @@ def test_direct_posting_mode_executes_reply_to_canonical_tweet(
             "Hermes instance."
         ),
         "tweet_id": "123",
-        "tweet_url": "https://x.com/some_user/status/123",
+        "tweet_url": "https://x.com/i/web/status/123",
     }
     assert calls == [
         (
             "expected_user",
-            "https://x.com/some_user/status/123",
+            "https://x.com/i/web/status/123",
             "direct reply",
             "123",
         )
@@ -574,16 +573,15 @@ def test_like_tweet_executes_one_canonical_verified_like(
         server,
         "like_tweet",
         {
-            "account": "expected_user",
-            "tweet_url": "https://Twitter.com/Some_User/status/123?utm=1",
+            "account": "@Expected_User",
+            "tweet_url": "https://x.com/i/web/status/123",
         },
     )
     second = call_tool(
         server,
         "like_tweet",
         {
-            "account": "expected_user",
-            "tweet_url": "https://x.com/some_user/status/123",
+            "tweet_url": "https://x.com/i/web/status/123",
         },
     )
 
@@ -592,14 +590,14 @@ def test_like_tweet_executes_one_canonical_verified_like(
         "account": "expected_user",
         "action": "like_tweet",
         "tweet_id": "123",
-        "tweet_url": "https://x.com/some_user/status/123",
+        "tweet_url": "https://x.com/i/web/status/123",
         "success": True,
         "already_liked": False,
     }
     assert second["ok"] is True
     assert second["already_liked"] is True
     assert calls == [
-        ("expected_user", "123", "https://x.com/some_user/status/123")
+        ("expected_user", "123", "https://x.com/i/web/status/123")
     ]
     assert sessions == ["expected_user"]
     assert pacing == ["expected_user"]
