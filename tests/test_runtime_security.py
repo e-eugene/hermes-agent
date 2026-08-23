@@ -138,6 +138,8 @@ def test_x_use_is_pinned_isolated_and_uses_system_chromedriver() -> None:
     assert "/opt/x-use/.venv" in content
     assert "chromium-driver" in content
     assert "--no-deps --no-build-isolation --editable /opt/x-use/source" in content
+    assert "COPY runtime/patch_x_use.py /usr/local/bin/patch_x_use.py" in content
+    assert "python3 /usr/local/bin/patch_x_use.py /opt/x-use/source" in content
     assert "x-use-requirements.lock" in content
     requirement_names = {
         line.split("==", 1)[0].lower()

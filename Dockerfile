@@ -24,6 +24,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY runtime/x-use-requirements.lock /opt/x-use/requirements.lock
+COPY runtime/patch_x_use.py /usr/local/bin/patch_x_use.py
 
 # x-use is intentionally isolated from Hermes' Python environment. The exact
 # audited upstream revision is retained as an editable source install so its
@@ -33,6 +34,7 @@ COPY runtime/x-use-requirements.lock /opt/x-use/requirements.lock
 RUN git clone https://github.com/ihuzaifashoukat/x-use.git /opt/x-use/source \
     && git -C /opt/x-use/source checkout --detach e57e215e45b3e68cbd8cd7c46799cd932c234eac \
     && test "$(git -C /opt/x-use/source rev-parse HEAD)" = e57e215e45b3e68cbd8cd7c46799cd932c234eac \
+    && python3 /usr/local/bin/patch_x_use.py /opt/x-use/source \
     && python3 -m venv /opt/x-use/.venv \
     && /opt/x-use/.venv/bin/pip install --no-cache-dir --requirement /opt/x-use/requirements.lock \
     && /opt/x-use/.venv/bin/pip install --no-cache-dir --no-deps --no-build-isolation --editable /opt/x-use/source \
@@ -72,6 +74,7 @@ RUN chmod 0755 \
     /usr/local/bin/hermes-x-use-configure \
     /usr/local/bin/hermes-x-use-native-preflight \
     && chmod 0644 \
+      /usr/local/bin/patch_x_use.py \
       /opt/hermes-runtime/hermes_x_use_common.py \
       /opt/hermes-runtime/hermes_x_use_adapter.py
 
