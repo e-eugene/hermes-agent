@@ -281,9 +281,19 @@ allowed_x_use_tools = [
     "get_draft",
     "reject_draft",
 ]
+direct_posting_enabled = (
+    os.environ.get("HERMES_X_DIRECT_POSTING_ENABLED", "").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 mcp_env = {
     "NO_PROXY": "127.0.0.1,localhost,::1",
     "no_proxy": "127.0.0.1,localhost,::1",
+    # Hermes launches MCP servers with this explicit environment instead of
+    # inheriting the runtime container environment. Keep the administrator-
+    # controlled direct-posting policy visible to the isolated x-use process.
+    "HERMES_X_DIRECT_POSTING_ENABLED": (
+        "true" if direct_posting_enabled else "false"
+    ),
 }
 proxy_url = os.environ.get("RESIDENTIAL_PROXY_URL")
 network_mode = os.environ.get("HERMES_BROWSER_NETWORK_MODE")

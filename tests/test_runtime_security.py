@@ -169,6 +169,9 @@ def test_hermes_native_mcp_has_a_defense_in_depth_allowlist() -> None:
     assert '"HTTP_PROXY": proxy_url' in content
     assert '"HTTPS_PROXY": proxy_url' in content
     assert '"NO_PROXY": "127.0.0.1,localhost,::1"' in content
+    assert 'os.environ.get("HERMES_X_DIRECT_POSTING_ENABLED", "")' in content
+    assert '"HERMES_X_DIRECT_POSTING_ENABLED": (' in content
+    assert '"true" if direct_posting_enabled else "false"' in content
     assert '"HERMES_BROWSER_NETWORK_MODE": "assigned_proxy"' in content
     assert '"HERMES_RESIDENTIAL_PROXY_PORT": str(parsed_proxy.port)' in content
     assert '"RESIDENTIAL_PROXY_URL": proxy_url' in content
