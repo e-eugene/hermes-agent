@@ -112,6 +112,10 @@ def capabilities() -> list[str]:
         "x_use_mcp",
         "x_session_import",
         "x_draft_approval",
+        # ``x_use_like`` is the capability consumed by engagement workflows.
+        # Keep the original spelling during the rollout so existing dashboard
+        # versions and operators that already check it continue to work.
+        "x_use_like",
         "x_like_tweet",
         *base,
     ]

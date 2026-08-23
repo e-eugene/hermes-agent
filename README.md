@@ -60,12 +60,16 @@ The service on `8643` is private-only and requires `Authorization: Bearer
 
 - `GET /health` returns runtime readiness plus
   `capabilities: ["x_use_mcp", "x_session_import", "x_draft_approval",
-  "x_like_tweet", "persistent_browser_profile", "remote_chromium",
+  "x_use_like", "x_like_tweet", "persistent_browser_profile", "remote_chromium",
   "network_status"]` and the last browser-network snapshot in `network`.
   When `HERMES_X_DIRECT_POSTING_ENABLED=true`, the capability list also
   contains `x_direct_posting`. The x-use
   capabilities appear only after installed Hermes has discovered exactly the
   curated 14-tool MCP surface during startup.
+  `x_use_like` means the runtime can run the immediate, idempotent
+  `like_tweet` action and return the canonical liked target URL/ID plus a
+  confirmed success result. `x_like_tweet` remains as a backwards-compatible
+  alias for existing consumers.
 - `GET /network/status` makes a one-off request from the actual headed Chromium
   CDP browser to a fixed public IP-echo endpoint. It returns only
   `{status: "healthy"|"unhealthy"|"unavailable", mode,
