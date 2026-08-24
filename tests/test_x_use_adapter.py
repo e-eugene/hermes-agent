@@ -488,9 +488,18 @@ def test_direct_posting_mode_executes_reply_to_canonical_tweet(
     async def fake_pacing(ctx, account: str):
         return None
 
+    async def fake_confirmed_reply_url(
+        ctx, *, account_id: str, target_tweet_id: str, reply_text: str
+    ):
+        assert account_id == "expected_user"
+        assert target_tweet_id == "123"
+        assert reply_text == "direct reply"
+        return "https://x.com/expected_user/status/456"
+
     monkeypatch.setenv("HERMES_X_DIRECT_POSTING_ENABLED", "1")
     monkeypatch.setattr(adapter.actions, "exec_reply", fake_reply)
     monkeypatch.setattr(adapter, "reserve_persistent_action_pacing", fake_pacing)
+    monkeypatch.setattr(adapter, "confirmed_direct_reply_url", fake_confirmed_reply_url)
     server = adapter.create_safe_server()
 
     result = call_tool(
@@ -514,6 +523,8 @@ def test_direct_posting_mode_executes_reply_to_canonical_tweet(
         ),
         "tweet_id": "123",
         "tweet_url": "https://x.com/i/web/status/123",
+        "comment_url": "https://x.com/expected_user/status/456",
+        "comment_text": "direct reply",
     }
     assert calls == [
         (

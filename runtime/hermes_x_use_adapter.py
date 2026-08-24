@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -119,6 +120,10 @@ MAX_RETAINED_TERMINAL_DRAFTS = 300
 MAX_SEARCH_QUERY_CHARS = 256
 MAX_SINGLE_TWEET_CANDIDATES = 20
 MAX_METRICS_FILE_BYTES = 256 * 1024
+# X can lag a few seconds before a newly published reply appears on the
+# account's Replies timeline.  This is still bounded so an unavailable page
+# cannot hold an agent indefinitely.
+MAX_REPLY_CONFIRMATION_ATTEMPTS = 10
 CDP_DEBUGGER_ADDRESS = "127.0.0.1:9222"
 CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
 # ``IDENTITY_EXPRESSION`` is intentionally formatted as a readable multiline
@@ -129,6 +134,7 @@ CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
 # the same expression as the raw-CDP health probe.
 SELENIUM_IDENTITY_SCRIPT = f"return ({IDENTITY_EXPRESSION.strip()});"
 logger = logging.getLogger(__name__)
+X_STATUS_LINK_PATTERN = re.compile(r"^/[^/]+/status/(?P<tweet_id>[0-9]{1,30})$")
 
 
 def resolve_runtime_account(ctx: Ctx, account: str | None):
@@ -890,6 +896,8 @@ def _direct_publish_envelope(
     *,
     tweet_url: str | None = None,
     tweet_id: str | None = None,
+    comment_url: str | None = None,
+    comment_text: str | None = None,
 ) -> dict[str, Any]:
     source = result if isinstance(result, dict) else {}
     if source.get("success") is not True:
@@ -916,7 +924,86 @@ def _direct_publish_envelope(
         payload["tweet_id"] = tweet_id
     if tweet_url is not None:
         payload["tweet_url"] = tweet_url
+    if action == "reply_to_tweet":
+        if not isinstance(comment_url, str) or not isinstance(comment_text, str):
+            raise RuntimeError("x-use could not confirm the published reply URL")
+        canonical_comment_url, comment_id = canonical_x_status_url(comment_url)
+        if comment_id == tweet_id:
+            raise RuntimeError("x-use returned the reply target as the published reply")
+        payload["comment_url"] = canonical_comment_url
+        payload["comment_text"] = comment_text
     return ok_(**payload)
+
+
+def _confirmed_direct_reply_url(
+    browser_manager: Any,
+    account_id: str,
+    target_tweet_id: str,
+    reply_text: str,
+) -> str | None:
+    """Find the just-posted own reply and return its canonical public URL.
+
+    The upstream x-use executor confirms that X accepted the compose action but
+    returns only the target status ID.  For engagement workflows the permalink
+    is a required durable artifact, so inspect the assigned account's own
+    replies in the same verified browser session.  An exact text match and a
+    fresh, non-target status ID prevent mistaking the parent post for the reply.
+    """
+
+    profile_url = f"https://x.com/{account_id}/with_replies"
+    expected = reply_text.strip()
+    for attempt in range(MAX_REPLY_CONFIRMATION_ATTEMPTS):
+        try:
+            if not browser_manager.navigate_to(profile_url):
+                continue
+            driver = browser_manager.get_driver()
+            articles = driver.find_elements(
+                "xpath", "//article[@data-testid='tweet']"
+            )
+            for article in articles[:30]:
+                try:
+                    text_nodes = article.find_elements(
+                        "xpath", ".//*[@data-testid='tweetText']"
+                    )
+                    visible_text = "\n".join(
+                        (node.text or "").strip() for node in text_nodes
+                    ).strip()
+                    if visible_text != expected:
+                        continue
+                    for anchor in article.find_elements("xpath", ".//a[@href]"):
+                        href = str(anchor.get_attribute("href") or "")
+                        match = X_STATUS_LINK_PATTERN.fullmatch(href)
+                        if match is None or match.group("tweet_id") == target_tweet_id:
+                            continue
+                        return canonical_x_status_url(f"https://x.com{href}")[0]
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if attempt + 1 < MAX_REPLY_CONFIRMATION_ATTEMPTS:
+            time.sleep(1.0)
+    return None
+
+
+async def confirmed_direct_reply_url(
+    ctx: Ctx,
+    *,
+    account_id: str,
+    target_tweet_id: str,
+    reply_text: str,
+) -> str | None:
+    """Confirm the public permalink while holding the existing X action lock."""
+
+    async with ctx.session_pool.session(account_id) as browser_manager:
+        result, cancellation = await definitive_to_thread(
+            _confirmed_direct_reply_url,
+            browser_manager,
+            account_id,
+            target_tweet_id,
+            reply_text,
+        )
+    raise_deferred_cancellation(cancellation)
+    return result
 
 
 def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
@@ -1305,12 +1392,20 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
                 reply_text=exact_text,
                 tweet_id=tweet_id,
             )
+            comment_url = await confirmed_direct_reply_url(
+                ctx,
+                account_id=account_id,
+                target_tweet_id=tweet_id,
+                reply_text=exact_text,
+            )
             return _direct_publish_envelope(
                 account_id,
                 "reply_to_tweet",
                 result,
                 tweet_url=canonical_url,
                 tweet_id=tweet_id,
+                comment_url=comment_url,
+                comment_text=exact_text,
             )
         draft = ctx.draft_store.create(
             account=account_id,
