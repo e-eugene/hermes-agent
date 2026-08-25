@@ -25,14 +25,22 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 from xuse import __version__ as upstream_version
 from xuse.core.config_loader import ConfigLoader
 from xuse.features.engagement import TweetEngagement
 from xuse.features.scraper import TweetScraper
+from xuse.features.scraper.parsing import find_article_with_status_id
 from xuse.mcp import actions
 from xuse.mcp.annotations import (
     LOCAL_WRITE_IDEMPOTENT,
@@ -1009,6 +1017,47 @@ def _confirmed_like_url(browser_manager: Any, target_url: str) -> str | None:
         return None
 
 
+def _like_tweet_outcome(
+    browser_manager: Any, *, tweet_id: str, tweet_url: str
+) -> str:
+    """Perform one like and preserve the only safe outcome distinction.
+
+    In particular, once Selenium has delivered the click, a missing immediate
+    DOM flip is not proof that X rejected it. The caller records it as accepted
+    and lets the confirmation endpoint inspect the target without another click.
+    """
+    try:
+        if not browser_manager.navigate_to(tweet_url):
+            return "target_not_found"
+        driver = browser_manager.get_driver()
+        article = find_article_with_status_id(driver, tweet_id)
+        if article is None:
+            return "target_not_found"
+        if article.find_elements(By.XPATH, './/button[@data-testid="unlike"]'):
+            return "already_liked"
+        button = WebDriverWait(article, 10).until(
+            EC.element_to_be_clickable((By.XPATH, './/button[@data-testid="like"]'))
+        )
+        button.click()
+        try:
+            WebDriverWait(article, 5).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, './/button[@data-testid="unlike"]')
+                )
+            )
+            return "clicked_confirmed"
+        except TimeoutException:
+            return "clicked_unconfirmed"
+    except ElementClickInterceptedException:
+        return "overlay"
+    except TimeoutException:
+        return "timeout"
+    except WebDriverException:
+        return "session_browser_error"
+    except Exception:
+        return "session_browser_error"
+
+
 async def confirmed_direct_reply_url(
     ctx: Ctx,
     *,
@@ -1381,7 +1430,7 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
 
         from xuse.mcp import executor as ex
 
-        account_id, raw, model = resolve_runtime_account(ctx, account)
+        account_id, raw, _model = resolve_runtime_account(ctx, account)
         ex.require_active(raw, account_id)
         try:
             canonical_url, tweet_id = canonical_x_status_url(tweet_url)
@@ -1405,36 +1454,46 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
 
         async with ctx.session_pool.session(account_id) as browser_manager:
             await reserve_persistent_action_pacing(ctx, account_id)
-            engagement = TweetEngagement(browser_manager, model)
-            success = await engagement.like_tweet(
-                tweet_id=tweet_id,
-                tweet_url=canonical_url,
+            outcome, cancellation = await definitive_to_thread(
+                lambda: _like_tweet_outcome(
+                    browser_manager, tweet_id=tweet_id, tweet_url=canonical_url
+                )
             )
-        if success:
+        raise_deferred_cancellation(cancellation)
+        accepted = outcome in {"already_liked", "clicked_confirmed", "clicked_unconfirmed"}
+        if outcome in {"already_liked", "clicked_confirmed"}:
             ex.mark_processed(ctx, dedup_key)
         try:
             metrics = ex.metrics_for(ctx, account_id)
             metrics.log_event(
                 "like",
-                "success" if success else "failure",
-                {"tweet_id": tweet_id, "source": "mcp"},
+                "success" if accepted else "failure",
+                {"tweet_id": tweet_id, "source": "mcp", "outcome": outcome},
             )
-            metrics.increment("likes" if success else "errors")
+            metrics.increment("likes" if accepted else "errors")
         except Exception:
             pass
-        if not success:
-            raise ToolError(f"Like on tweet {tweet_id} failed.")
+        if not accepted:
+            raise ToolError(f"Like failed: {outcome}.")
+        confirmed = outcome in {"already_liked", "clicked_confirmed"}
         return ok_(
             account=account_id,
             action="like_tweet",
             tweet_id=tweet_id,
             tweet_url=canonical_url,
             success=True,
-            already_liked=False,
-            outcome="clicked_confirmed",
+            already_liked=outcome == "already_liked",
+            outcome=outcome,
             receipt={
-                "action": "like", "status": "confirmed",
-                "target_tweet_url": canonical_url, "permalink": canonical_url,
+                "action": "like",
+                "status": "confirmed" if confirmed else "accepted",
+                "target_tweet_url": canonical_url,
+                **({"permalink": canonical_url} if confirmed else {}),
+                **(
+                    {"diagnostic_code": "like_confirmation_pending"}
+                    if not confirmed
+                    else {}
+                ),
             },
         )
 

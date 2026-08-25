@@ -558,20 +558,15 @@ def test_like_tweet_executes_one_canonical_verified_like(
         async def close_all(self):
             return None
 
-    class FakeEngagement:
-        def __init__(self, browser_manager, model):
-            self.browser_manager = browser_manager
-            self.model = model
-
-        async def like_tweet(self, tweet_id: str, tweet_url: str) -> bool:
-            calls.append((self.model.account_id, tweet_id, tweet_url))
-            return True
+    def fake_like_outcome(browser_manager, *, tweet_id: str, tweet_url: str) -> str:
+        calls.append(("expected_user", tweet_id, tweet_url))
+        return "clicked_confirmed"
 
     async def fake_pacing(ctx, account: str):
         pacing.append(account)
 
     monkeypatch.setattr(adapter, "session_pool", lambda loader: FakePool())
-    monkeypatch.setattr(adapter, "TweetEngagement", FakeEngagement)
+    monkeypatch.setattr(adapter, "_like_tweet_outcome", fake_like_outcome)
     monkeypatch.setattr(adapter, "reserve_persistent_action_pacing", fake_pacing)
     server = adapter.create_safe_server()
 
@@ -648,6 +643,47 @@ def test_like_tweet_rejects_noncanonical_targets_without_touching_browser(
 
     assert result["ok"] is False
     assert "https://x.com tweet URL" in result["error"]["message"]
+    asyncio.run(adapter.shutdown_safe_server(server))
+
+
+def test_like_tweet_click_without_dom_flip_is_accepted_for_read_only_confirmation(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakePool:
+        idle_timeout_seconds = 600
+
+        def find_account_dict(self, account: str):
+            return {"account_id": account, "is_active": True}
+
+        @asynccontextmanager
+        async def session(self, account: str):
+            yield object()
+
+        async def close_all(self):
+            return None
+
+    async def fake_pacing(ctx, account: str):
+        return None
+
+    monkeypatch.setattr(adapter, "session_pool", lambda loader: FakePool())
+    monkeypatch.setattr(
+        adapter, "_like_tweet_outcome", lambda *_args, **_kwargs: "clicked_unconfirmed"
+    )
+    monkeypatch.setattr(adapter, "reserve_persistent_action_pacing", fake_pacing)
+    server = adapter.create_safe_server()
+
+    result = call_tool(
+        server, "like_tweet", {"tweet_url": "https://x.com/i/web/status/123"}
+    )
+
+    assert result["ok"] is True
+    assert result["outcome"] == "clicked_unconfirmed"
+    assert result["receipt"] == {
+        "action": "like",
+        "status": "accepted",
+        "target_tweet_url": "https://x.com/i/web/status/123",
+        "diagnostic_code": "like_confirmation_pending",
+    }
     asyncio.run(adapter.shutdown_safe_server(server))
 
 
