@@ -15,7 +15,6 @@ import json
 import logging
 import math
 import os
-import re
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -133,6 +132,7 @@ MAX_METRICS_FILE_BYTES = 256 * 1024
 # account's Replies timeline.  This is still bounded so an unavailable page
 # cannot hold an agent indefinitely.
 MAX_REPLY_CONFIRMATION_ATTEMPTS = 10
+REPLY_DISCLOSURE_SETTLE_SECONDS = 0.5
 CDP_DEBUGGER_ADDRESS = "127.0.0.1:9222"
 CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
 # ``IDENTITY_EXPRESSION`` is intentionally formatted as a readable multiline
@@ -143,7 +143,42 @@ CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
 # the same expression as the raw-CDP health probe.
 SELENIUM_IDENTITY_SCRIPT = f"return ({IDENTITY_EXPRESSION.strip()});"
 logger = logging.getLogger(__name__)
-X_STATUS_LINK_PATTERN = re.compile(r"^/[^/]+/status/(?P<tweet_id>[0-9]{1,30})$")
+TWEET_ARTICLE_XPATH = "//article[@data-testid='tweet']"
+# X puts the ``Show probable spam`` control outside a tweet article in the
+# conversation column. Keep the query structural so localized labels are
+# discovered through their semantic button role rather than an English text
+# selector. Excluding tweet descendants rules out reply/like/repost controls,
+# which are writes or other actions rather than reply disclosure.
+REPLY_DISCLOSURE_CONTROL_XPATH = (
+    "//div[@data-testid='primaryColumn']//*[(@role='button' or self::button) "
+    "and not(ancestor::article[@data-testid='tweet'])]"
+)
+REPLY_DISCLOSURE_WRITE_TEST_IDS = frozenset(
+    {
+        "reply",
+        "like",
+        "unlike",
+        "retweet",
+        "unretweet",
+        "bookmark",
+        "removeBookmark",
+        "share",
+        "send",
+        "caret",
+    }
+)
+# These are the disclosure labels supported by this runtime contract. New X
+# localizations must be added deliberately: an unknown control stays pending
+# rather than risking a click on an unrelated X action.
+REPLY_DISCLOSURE_LABELS = frozenset(
+    {
+        "show probable spam",
+        "show possible spam",
+        "show additional replies, including those that may contain offensive content",
+        "показать возможный спам",
+        "показать вероятный спам",
+    }
+)
 
 
 def apply_selenium_low_data_controls(driver: Any) -> None:
@@ -985,49 +1020,184 @@ def _direct_publish_envelope(
     return ok_(**payload)
 
 
+def _normalized_visible_text(value: object) -> str:
+    """Normalize DOM layout whitespace without weakening an exact text proof."""
+
+    return " ".join(str(value or "").split())
+
+
+def _canonical_status_href(href: object) -> tuple[str, str] | None:
+    """Return one canonical X status link from Selenium's relative or absolute href."""
+
+    value = str(href or "").strip()
+    if value.startswith("/"):
+        value = f"https://x.com{value}"
+    try:
+        return canonical_x_status_url(value)
+    except ValueError:
+        return None
+
+
+def _reply_permalink_from_view(
+    driver: Any,
+    *,
+    account_id: str,
+    target_tweet_id: str,
+    reply_text: str,
+) -> str | None:
+    """Find the exact assigned-account reply among rendered tweet articles."""
+
+    expected = _normalized_visible_text(reply_text)
+    if not expected:
+        return None
+    try:
+        articles = driver.find_elements("xpath", TWEET_ARTICLE_XPATH)
+    except Exception:
+        return None
+    own_reply_prefix = f"https://x.com/{account_id}/status/"
+    for article in articles[:30]:
+        try:
+            text_nodes = article.find_elements(
+                "xpath", ".//*[@data-testid='tweetText']"
+            )
+            visible_text = _normalized_visible_text(
+                "\n".join((node.text or "").strip() for node in text_nodes)
+            )
+            if visible_text != expected:
+                continue
+            # X renders the article's own status permalink on its timestamp.
+            # Restricting to that anchor avoids treating a quoted/status link
+            # embedded by another author as proof of our reply.
+            for anchor in article.find_elements(
+                "xpath", ".//a[@href and .//time]"
+            ):
+                candidate = _canonical_status_href(anchor.get_attribute("href"))
+                if candidate is None:
+                    continue
+                permalink, status_id = candidate
+                # Source-tweet search must not confuse an identical reply from
+                # another account with ours. A non-parent status link owned by
+                # the assigned account is the durable public proof.
+                if (
+                    status_id != target_tweet_id
+                    and permalink.startswith(own_reply_prefix)
+                ):
+                    return permalink
+        except Exception:
+            continue
+    return None
+
+
+def _reply_disclosure_accessible_name(control: Any) -> str:
+    """Read the localized semantic name of one non-writing disclosure control."""
+
+    values: list[str] = []
+    for attribute in ("aria-label", "title", "innerText", "textContent"):
+        try:
+            value = control.get_attribute(attribute)
+        except Exception:
+            value = None
+        normalized = _normalized_visible_text(value)
+        if normalized:
+            values.append(normalized)
+    visible_text = _normalized_visible_text(getattr(control, "text", ""))
+    if visible_text:
+        values.append(visible_text)
+    return " ".join(values)
+
+
+def _is_reply_disclosure_control(control: Any) -> bool:
+    """Accept only a localized, read-only X reply-disclosure affordance."""
+
+    try:
+        test_id = str(control.get_attribute("data-testid") or "").casefold()
+        style = str(control.get_attribute("style") or "").casefold()
+    except Exception:
+        return False
+    if test_id in {item.casefold() for item in REPLY_DISCLOSURE_WRITE_TEST_IDS}:
+        return False
+    # A blurred media-sensitive-content curtain is not a reply disclosure and
+    # must never be opened as a side effect of verification.
+    if "backdrop-filter" in style or "blur" in style:
+        return False
+    name = _reply_disclosure_accessible_name(control)
+    if not name or len(name) > 200:
+        return False
+    normalized_name = name.casefold()
+    return any(label in normalized_name for label in REPLY_DISCLOSURE_LABELS)
+
+
+def _reveal_hidden_reply_section(driver: Any) -> bool:
+    """Click at most one verified reply disclosure and never an X write control."""
+
+    try:
+        controls = driver.find_elements("xpath", REPLY_DISCLOSURE_CONTROL_XPATH)
+    except Exception:
+        return False
+    for control in controls:
+        if not _is_reply_disclosure_control(control):
+            continue
+        try:
+            control.click()
+        except Exception:
+            continue
+        return True
+    return False
+
+
 def _confirmed_direct_reply_url(
     browser_manager: Any,
     account_id: str,
     target_tweet_id: str,
     reply_text: str,
+    target_tweet_url: str | None = None,
 ) -> str | None:
-    """Find the just-posted own reply and return its canonical public URL.
+    """Find a public permalink for the accepted reply without another X write.
 
-    The upstream x-use executor confirms that X accepted the compose action but
-    returns only the target status ID.  For engagement workflows the permalink
-    is a required durable artifact, so inspect the assigned account's own
-    replies in the same verified browser session.  An exact text match and a
-    fresh, non-target status ID prevent mistaking the parent post for the reply.
+    A source-tweet scan is primary because X can hide the accepted reply behind
+    its probable-spam disclosure. We inspect normal replies first, reveal only
+    the semantic disclosure control, then re-scan. The older profile timeline
+    is retained only as a compatibility fallback for ordinary replies that X
+    has not ranked into the source thread yet.
     """
 
+    source_url = target_tweet_url or f"https://x.com/i/web/status/{target_tweet_id}"
+    try:
+        source_url = canonical_x_status_url(source_url)[0]
+    except ValueError:
+        source_url = f"https://x.com/i/web/status/{target_tweet_id}"
     profile_url = f"https://x.com/{account_id}/with_replies"
-    expected = reply_text.strip()
     for attempt in range(MAX_REPLY_CONFIRMATION_ATTEMPTS):
         try:
-            if not browser_manager.navigate_to(profile_url):
-                continue
-            driver = browser_manager.get_driver()
-            articles = driver.find_elements(
-                "xpath", "//article[@data-testid='tweet']"
-            )
-            for article in articles[:30]:
-                try:
-                    text_nodes = article.find_elements(
-                        "xpath", ".//*[@data-testid='tweetText']"
+            if browser_manager.navigate_to(source_url):
+                driver = browser_manager.get_driver()
+                confirmed = _reply_permalink_from_view(
+                    driver,
+                    account_id=account_id,
+                    target_tweet_id=target_tweet_id,
+                    reply_text=reply_text,
+                )
+                if confirmed:
+                    return confirmed
+                if _reveal_hidden_reply_section(driver):
+                    time.sleep(REPLY_DISCLOSURE_SETTLE_SECONDS)
+                    confirmed = _reply_permalink_from_view(
+                        driver,
+                        account_id=account_id,
+                        target_tweet_id=target_tweet_id,
+                        reply_text=reply_text,
                     )
-                    visible_text = "\n".join(
-                        (node.text or "").strip() for node in text_nodes
-                    ).strip()
-                    if visible_text != expected:
-                        continue
-                    for anchor in article.find_elements("xpath", ".//a[@href]"):
-                        href = str(anchor.get_attribute("href") or "")
-                        match = X_STATUS_LINK_PATTERN.fullmatch(href)
-                        if match is None or match.group("tweet_id") == target_tweet_id:
-                            continue
-                        return canonical_x_status_url(f"https://x.com{href}")[0]
-                except Exception:
-                    continue
+                    if confirmed:
+                        return confirmed
+            if browser_manager.navigate_to(profile_url):
+                confirmed = _reply_permalink_from_view(
+                    browser_manager.get_driver(),
+                    account_id=account_id,
+                    target_tweet_id=target_tweet_id,
+                    reply_text=reply_text,
+                )
+                if confirmed:
+                    return confirmed
         except Exception:
             pass
         if attempt + 1 < MAX_REPLY_CONFIRMATION_ATTEMPTS:
@@ -1111,6 +1281,7 @@ async def confirmed_direct_reply_url(
     account_id: str,
     target_tweet_id: str,
     reply_text: str,
+    target_tweet_url: str | None = None,
 ) -> str | None:
     """Confirm the public permalink while holding the existing X action lock."""
 
@@ -1121,6 +1292,7 @@ async def confirmed_direct_reply_url(
             account_id,
             target_tweet_id,
             reply_text,
+            target_tweet_url,
         )
     raise_deferred_cancellation(cancellation)
     return result
@@ -1153,7 +1325,11 @@ async def confirm_dashboard_action(
             else:
                 result, cancellation = await definitive_to_thread(
                     _confirmed_direct_reply_url,
-                    browser_manager, account_id, target_id, reply_text.strip(),
+                    browser_manager,
+                    account_id,
+                    target_id,
+                    reply_text.strip(),
+                    target_url,
                 )
         raise_deferred_cancellation(cancellation)
     except (WrongAccountError, SessionNotVerifiedError):

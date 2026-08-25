@@ -631,6 +631,261 @@ def test_direct_posting_mode_executes_reply_to_canonical_tweet(
     asyncio.run(adapter.shutdown_safe_server(server))
 
 
+def reply_confirmation_browser(
+    adapter,
+    *,
+    reply_visible: bool,
+    reply_href: str = "https://x.com/expected_user/status/456",
+    disclosure_label: str | None = None,
+):
+    """Build a minimal source-thread DOM for read-only receipt proofs."""
+
+    class TextNode:
+        text = "Exact accepted reply"
+
+    class Anchor:
+        def get_attribute(self, name: str):
+            return reply_href if name == "href" else None
+
+    class Article:
+        def find_elements(self, _by: str, selector: str):
+            if selector == ".//*[@data-testid='tweetText']":
+                return [TextNode()]
+            if selector == ".//a[@href and .//time]":
+                return [Anchor()]
+            return []
+
+    class Disclosure:
+        text = disclosure_label or ""
+
+        def __init__(self, driver):
+            self.driver = driver
+            self.clicks = 0
+
+        def get_attribute(self, name: str):
+            if name == "innerText":
+                return self.text
+            if name == "data-testid":
+                return None
+            if name == "style":
+                return ""
+            if name in {"aria-label", "title", "aria-controls", "aria-expanded"}:
+                return None
+            return None
+
+        def click(self):
+            self.clicks += 1
+            self.driver.reply_visible = True
+
+    class Driver:
+        def __init__(self):
+            self.reply_visible = reply_visible
+            self.disclosure = Disclosure(self) if disclosure_label else None
+
+        def find_elements(self, _by: str, selector: str):
+            if selector == adapter.TWEET_ARTICLE_XPATH:
+                return [Article()] if self.reply_visible else []
+            if selector == adapter.REPLY_DISCLOSURE_CONTROL_XPATH:
+                return [self.disclosure] if self.disclosure else []
+            return []
+
+    class Manager:
+        def __init__(self, driver):
+            self.driver = driver
+            self.navigations: list[str] = []
+
+        def navigate_to(self, url: str):
+            self.navigations.append(url)
+            return True
+
+        def get_driver(self):
+            return self.driver
+
+    driver = Driver()
+    return Manager(driver), driver
+
+
+def test_reply_confirmation_checks_source_thread_with_absolute_status_href(adapter) -> None:
+    manager, driver = reply_confirmation_browser(adapter, reply_visible=True)
+
+    result = adapter._confirmed_direct_reply_url(
+        manager,
+        "expected_user",
+        "123",
+        "Exact accepted reply",
+        "https://x.com/source_user/status/123",
+    )
+
+    assert result == "https://x.com/expected_user/status/456"
+    assert manager.navigations == ["https://x.com/source_user/status/123"]
+    assert driver.disclosure is None
+
+
+@pytest.mark.parametrize(
+    "disclosure_label",
+    ["Show probable spam", "Показать возможный спам"],
+)
+def test_reply_confirmation_reveals_localized_hidden_spam_reply(
+    adapter, monkeypatch: pytest.MonkeyPatch, disclosure_label: str
+) -> None:
+    manager, driver = reply_confirmation_browser(
+        adapter,
+        reply_visible=False,
+        disclosure_label=disclosure_label,
+    )
+    monkeypatch.setattr(adapter.time, "sleep", lambda _seconds: None)
+
+    result = adapter._confirmed_direct_reply_url(
+        manager,
+        "expected_user",
+        "123",
+        "Exact accepted reply",
+        "https://x.com/source_user/status/123",
+    )
+
+    assert result == "https://x.com/expected_user/status/456"
+    assert driver.disclosure is not None
+    assert driver.disclosure.clicks == 1
+    assert manager.navigations == ["https://x.com/source_user/status/123"]
+
+
+def test_reply_confirmation_does_not_click_an_unrecognized_disclosure_control(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, driver = reply_confirmation_browser(
+        adapter,
+        reply_visible=False,
+        disclosure_label="Show more replies",
+    )
+    monkeypatch.setattr(adapter, "MAX_REPLY_CONFIRMATION_ATTEMPTS", 1)
+
+    result = adapter._confirmed_direct_reply_url(
+        manager,
+        "expected_user",
+        "123",
+        "Exact accepted reply",
+        "https://x.com/source_user/status/123",
+    )
+
+    assert result is None
+    assert driver.disclosure is not None
+    assert driver.disclosure.clicks == 0
+
+
+def test_reply_disclosure_filter_rejects_generic_or_writing_controls(adapter) -> None:
+    class Control:
+        text = "Show more replies"
+
+        def __init__(
+            self, *, test_id: str | None = None, text: str = "Show more replies"
+        ):
+            self.test_id = test_id
+            self.text = text
+
+        def get_attribute(self, name: str):
+            values = {
+                "data-testid": self.test_id,
+                "style": "",
+                "aria-label": "Show",
+                "aria-controls": "reply-region",
+                "aria-expanded": "false",
+                "innerText": self.text,
+                "textContent": self.text,
+            }
+            return values.get(name)
+
+    assert adapter._is_reply_disclosure_control(Control()) is False
+    assert adapter._is_reply_disclosure_control(
+        Control(test_id="like", text="Show probable spam")
+    ) is False
+
+
+def test_reply_confirmation_rejects_identical_text_from_another_account(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _driver = reply_confirmation_browser(
+        adapter,
+        reply_visible=True,
+        reply_href="/another_user/status/456",
+    )
+    monkeypatch.setattr(adapter, "MAX_REPLY_CONFIRMATION_ATTEMPTS", 1)
+
+    result = adapter._confirmed_direct_reply_url(
+        manager,
+        "expected_user",
+        "123",
+        "Exact accepted reply",
+        "https://x.com/source_user/status/123",
+    )
+
+    assert result is None
+    assert manager.navigations == [
+        "https://x.com/source_user/status/123",
+        "https://x.com/expected_user/with_replies",
+    ]
+
+
+def test_dashboard_reply_confirmation_only_uses_the_read_only_proof_path(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, str, str, str, str | None]] = []
+
+    class Pool:
+        @asynccontextmanager
+        async def session(self, account: str):
+            assert account == "expected_user"
+            yield "verified-browser"
+
+    def fake_proof(
+        browser_manager,
+        account_id: str,
+        target_tweet_id: str,
+        reply_text: str,
+        target_tweet_url: str | None,
+    ):
+        calls.append(
+            (
+                browser_manager,
+                account_id,
+                target_tweet_id,
+                reply_text,
+                target_tweet_url,
+            )
+        )
+        return "https://x.com/expected_user/status/456"
+
+    async def unexpected_write(*_args, **_kwargs):
+        pytest.fail("receipt confirmation must not send an X write")
+
+    monkeypatch.setattr(adapter, "runtime_config_loader", lambda: object())
+    monkeypatch.setattr(adapter, "session_pool", lambda _loader: Pool())
+    monkeypatch.setattr(adapter, "_confirmed_direct_reply_url", fake_proof)
+    monkeypatch.setattr(adapter.actions, "exec_reply", unexpected_write)
+    monkeypatch.setattr(adapter.actions, "exec_like", unexpected_write, raising=False)
+
+    result = asyncio.run(
+        adapter.confirm_dashboard_action(
+            action="reply",
+            target_tweet_url="https://x.com/source_user/status/123",
+            reply_text="Exact accepted reply",
+        )
+    )
+
+    assert result == {
+        "status": "confirmed",
+        "permalink": "https://x.com/expected_user/status/456",
+    }
+    assert calls == [
+        (
+            "verified-browser",
+            "expected_user",
+            "123",
+            "Exact accepted reply",
+            "https://x.com/source_user/status/123",
+        )
+    ]
+
+
 def test_like_tweet_executes_one_canonical_verified_like(
     adapter, monkeypatch: pytest.MonkeyPatch
 ) -> None:

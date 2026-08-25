@@ -60,8 +60,10 @@ The service on `8643` is private-only and requires `Authorization: Bearer
 
 - `GET /health` returns runtime readiness plus
   `capabilities: ["x_use_mcp", "x_session_import", "x_draft_approval",
-  "x_use_like", "x_like_tweet", "persistent_browser_profile", "remote_chromium",
-  "network_status"]` and the last browser-network snapshot in `network`.
+  "x_use_like", "x_like_tweet", "x_action_receipts_v2",
+  "x_action_confirmation_hidden_spam_v1", "persistent_browser_profile",
+  "remote_chromium", "network_status"]` and the last browser-network
+  snapshot in `network`.
   When `HERMES_X_DIRECT_POSTING_ENABLED=true`, the capability list also
   contains `x_direct_posting`. The x-use
   capabilities appear only after installed Hermes has discovered exactly the
@@ -89,6 +91,14 @@ The service on `8643` is private-only and requires `Authorization: Bearer
   not exposed by MCP. Ordinary Hermes terminal and browser tools remain
   available for general agent work; they are outside this x-use draft approval
   boundary and should be governed by the operator's normal Hermes policy.
+- `POST /x-use/actions/confirm` is a read-only proof lookup for an already
+  accepted `like` or `reply` receipt. It returns either a canonical permalink,
+  `pending`, or a fixed diagnostic; it never creates a draft or sends another
+  X action. Reply confirmation opens the source tweet first, scans normal
+  replies, then reveals X's localized probable-spam reply disclosure when
+  present and matches the exact assigned-account reply text. The
+  `x_action_confirmation_hidden_spam_v1` capability is the version gate for
+  that behavior.
 
 Remote Chromium connects through a single-controller, binary WebSocket bridge
 on `6081`. It forwards only to an `x11vnc` process bound to container loopback;
