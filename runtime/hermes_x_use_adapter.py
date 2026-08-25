@@ -134,7 +134,10 @@ MAX_METRICS_FILE_BYTES = 256 * 1024
 # One source-thread navigation is capped well below the dashboard's 90-second
 # control-request timeout.
 DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = 45
-REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS = 30
+DEFAULT_IDENTITY_TIMEOUT_SECONDS = 35
+CONFIRMATION_PROCESS_LOCK_TIMEOUT_SECONDS = 5
+CONFIRMATION_IDENTITY_TIMEOUT_SECONDS = 30
+CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS = 30
 REPLY_DISCLOSURE_SETTLE_SECONDS = 0.5
 CDP_DEBUGGER_ADDRESS = "127.0.0.1:9222"
 CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
@@ -181,6 +184,9 @@ REPLY_DISCLOSURE_LABELS = frozenset(
         "показать возможный спам",
         "показать вероятный спам",
     }
+)
+REPLY_DISCLOSURE_LABELS_CASEFOLDED = frozenset(
+    label.casefold() for label in REPLY_DISCLOSURE_LABELS
 )
 
 
@@ -331,7 +337,12 @@ class SafeAttachedBrowserManager:
             time.sleep(0.05)
         raise RuntimeError("Chromedriver did not expose the dedicated x-use target")
 
-    def get_driver(self):
+    def get_driver(
+        self,
+        *,
+        identity_timeout: float = DEFAULT_IDENTITY_TIMEOUT_SECONDS,
+        identity_page_load_timeout: float | None = None,
+    ):
         if self.driver is not None and self.is_driver_active():
             self._switch_to_owned()
             self._apply_low_data_controls()
@@ -351,7 +362,16 @@ class SafeAttachedBrowserManager:
             self._owned_handle = self._create_owned_target()
             self._switch_to_owned()
             self._apply_low_data_controls()
-            self.ensure_expected_handle()
+            if (
+                identity_timeout == DEFAULT_IDENTITY_TIMEOUT_SECONDS
+                and identity_page_load_timeout is None
+            ):
+                self.ensure_expected_handle()
+            else:
+                self.ensure_expected_handle(
+                    timeout=identity_timeout,
+                    page_load_timeout=identity_page_load_timeout,
+                )
             return driver
         except Exception:
             self.close_driver()
@@ -415,15 +435,38 @@ class SafeAttachedBrowserManager:
                     pass
         return False
 
-    def ensure_expected_handle(self, timeout: float = 35) -> str:
+    def ensure_expected_handle(
+        self,
+        timeout: float = DEFAULT_IDENTITY_TIMEOUT_SECONDS,
+        *,
+        page_load_timeout: float | None = None,
+    ) -> str:
         """Navigate only the owned target and fail closed on any mismatch."""
 
         if self.driver is None:
             raise SessionNotVerifiedError("Persistent Chromium is unavailable")
+        deadline = time.monotonic() + max(0, timeout)
         self._switch_to_owned()
         self._apply_low_data_controls()
-        self.driver.get(X_HOME_URL)
-        deadline = time.monotonic() + max(0, timeout)
+        if page_load_timeout is None:
+            self.driver.get(X_HOME_URL)
+        else:
+            set_page_load_timeout = getattr(self.driver, "set_page_load_timeout", None)
+            if not callable(set_page_load_timeout):
+                raise SessionNotVerifiedError(
+                    "Persistent Chromium page timeout could not be bounded"
+                )
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                raise SessionNotVerifiedError("X session identity timed out")
+            try:
+                set_page_load_timeout(min(float(page_load_timeout), remaining))
+                self.driver.get(X_HOME_URL)
+            finally:
+                try:
+                    set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+                except Exception:
+                    pass
         actual: str | None = None
         while True:
             try:
@@ -516,15 +559,13 @@ class VerifiedSessionPool(SessionPool):
             def verify_manager() -> None:
                 # A supervised Chromium restart invalidates the cached
                 # chromedriver transport and its owned target. get_driver()
-                # detects that stale state, closes only our transport, and
+                # detects that stale state, closes only this transport, and
                 # reattaches before the per-action identity proof below.
                 entry.browser_manager.get_driver()
                 entry.browser_manager.ensure_expected_handle()
 
             try:
-                _, cancellation = await definitive_to_thread(
-                    verify_manager
-                )
+                _, cancellation = await definitive_to_thread(verify_manager)
                 raise_deferred_cancellation(cancellation)
                 yield entry.browser_manager
             finally:
@@ -532,6 +573,59 @@ class VerifiedSessionPool(SessionPool):
                 await definitive_to_thread(
                     release_browser_action_lock, process_lock
                 )
+
+    @asynccontextmanager
+    async def confirmation_session(self, account_id: str):
+        """Create one bounded, one-shot browser target for receipt proof.
+
+        Confirmation is not a normal x-use action session: it must not cold
+        start a cached pool entry and then perform a second identity check.
+        This path acquires the same cross-process browser lock, makes one fresh
+        attached target, proves the assigned account within a single 30-second
+        home/identity deadline, yields it for the one source-thread scan, and
+        closes only that owned target before releasing the lock.
+        """
+
+        process_lock, lock_cancellation = await definitive_to_thread(
+            acquire_browser_action_lock,
+            CONFIRMATION_PROCESS_LOCK_TIMEOUT_SECONDS,
+        )
+        if lock_cancellation is not None:
+            await definitive_to_thread(release_browser_action_lock, process_lock)
+            raise lock_cancellation
+
+        manager: Any | None = None
+        try:
+            account_dict = self.find_account_dict(account_id)
+
+            def start_manager():
+                fresh_manager = (
+                    self._browser_factory(account_dict)
+                    if self._browser_factory is not None
+                    else SafeAttachedBrowserManager(account_dict, self.config_loader)
+                )
+                fresh_manager.get_driver(
+                    identity_timeout=CONFIRMATION_IDENTITY_TIMEOUT_SECONDS,
+                    identity_page_load_timeout=CONFIRMATION_IDENTITY_TIMEOUT_SECONDS,
+                )
+                return fresh_manager
+
+            manager, cancellation = await definitive_to_thread(start_manager)
+            raise_deferred_cancellation(cancellation)
+            yield manager
+        finally:
+            close_cancellation: asyncio.CancelledError | None = None
+            try:
+                if manager is not None:
+                    _, close_cancellation = await definitive_to_thread(
+                        manager.close_driver
+                    )
+            finally:
+                _, release_cancellation = await definitive_to_thread(
+                    release_browser_action_lock, process_lock
+                )
+            raise_deferred_cancellation(close_cancellation)
+            raise_deferred_cancellation(release_cancellation)
 
 
 class LockedBoundedDraftStore(DraftStore):
@@ -1091,22 +1185,26 @@ def _reply_permalink_from_view(
     return None
 
 
-def _reply_disclosure_accessible_name(control: Any) -> str:
-    """Read the localized semantic name of one non-writing disclosure control."""
+def _reply_disclosure_accessible_names(control: Any) -> tuple[str, ...]:
+    """Return deduplicated individual semantic names for one control."""
 
     values: list[str] = []
+    seen: set[str] = set()
     for attribute in ("aria-label", "title", "innerText", "textContent"):
         try:
             value = control.get_attribute(attribute)
         except Exception:
             value = None
         normalized = _normalized_visible_text(value)
-        if normalized:
+        normalized_key = normalized.casefold()
+        if normalized and normalized_key not in seen:
             values.append(normalized)
+            seen.add(normalized_key)
     visible_text = _normalized_visible_text(getattr(control, "text", ""))
-    if visible_text:
+    visible_text_key = visible_text.casefold()
+    if visible_text and visible_text_key not in seen:
         values.append(visible_text)
-    return " ".join(values)
+    return tuple(values)
 
 
 def _is_reply_disclosure_control(control: Any) -> bool:
@@ -1123,11 +1221,11 @@ def _is_reply_disclosure_control(control: Any) -> bool:
     # must never be opened as a side effect of verification.
     if "backdrop-filter" in style or "blur" in style:
         return False
-    name = _reply_disclosure_accessible_name(control)
-    if not name or len(name) > 200:
-        return False
-    normalized_name = name.casefold()
-    return any(label in normalized_name for label in REPLY_DISCLOSURE_LABELS)
+    names = _reply_disclosure_accessible_names(control)
+    return any(
+        len(name) <= 200 and name.casefold() in REPLY_DISCLOSURE_LABELS_CASEFOLDED
+        for name in names
+    )
 
 
 def _reveal_hidden_reply_section(driver: Any) -> bool:
@@ -1148,7 +1246,7 @@ def _reveal_hidden_reply_section(driver: Any) -> bool:
     return False
 
 
-def _navigate_for_reply_confirmation(
+def _navigate_for_confirmation(
     browser_manager: Any,
     driver: Any,
     url: str,
@@ -1221,11 +1319,11 @@ def _confirmed_direct_reply_url(
         # so this reads the same owned target without another identity/home
         # navigation.
         driver = browser_manager.get_driver()
-        if not _navigate_for_reply_confirmation(
+        if not _navigate_for_confirmation(
             browser_manager,
             driver,
             source_url,
-            page_load_timeout=REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS,
+            page_load_timeout=CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
         ):
             return None
 
@@ -1269,14 +1367,23 @@ def _confirmed_direct_reply_url(
 
 def _confirmed_like_url(browser_manager: Any, target_url: str) -> str | None:
     """Read-only proof that the target currently exposes its unlike control."""
-    if not browser_manager.navigate_to(target_url):
-        return None
+    driver: Any | None = None
     try:
         driver = browser_manager.get_driver()
+        if not _navigate_for_confirmation(
+            browser_manager,
+            driver,
+            target_url,
+            page_load_timeout=CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
+        ):
+            return None
         buttons = driver.find_elements("xpath", "//*[@data-testid='unlike']")
         return target_url if buttons else None
     except Exception:
         return None
+    finally:
+        if driver is not None:
+            _restore_default_page_load_timeout(driver)
 
 
 def _like_tweet_outcome(
@@ -1380,7 +1487,9 @@ async def confirm_dashboard_action(
     confirmation_evidence: dict[str, Any] = {}
     try:
         loader = runtime_config_loader()
-        async with session_pool(loader).session(account_id) as browser_manager:
+        async with session_pool(loader).confirmation_session(
+            account_id
+        ) as browser_manager:
             if action == "like":
                 result, cancellation = await definitive_to_thread(
                     _confirmed_like_url, browser_manager, target_url

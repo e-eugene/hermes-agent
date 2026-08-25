@@ -727,7 +727,7 @@ def test_reply_confirmation_checks_source_thread_with_absolute_status_href(adapt
     assert manager.navigations == ["https://x.com/source_user/status/123"]
     assert driver.disclosure is None
     assert driver.page_load_timeouts == [
-        adapter.REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
         adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
     ]
     assert evidence == {}
@@ -762,7 +762,7 @@ def test_reply_confirmation_reveals_localized_hidden_spam_reply(
     assert driver.disclosure.clicks == 1
     assert manager.navigations == ["https://x.com/source_user/status/123"]
     assert driver.page_load_timeouts == [
-        adapter.REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
         adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
     ]
     assert evidence == {
@@ -794,7 +794,7 @@ def test_reply_confirmation_does_not_click_an_unrecognized_disclosure_control(
         "https://x.com/source_user/status/123",
     ]
     assert driver.page_load_timeouts == [
-        adapter.REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
         adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
     ]
 
@@ -823,6 +823,9 @@ def test_reply_disclosure_filter_rejects_generic_or_writing_controls(adapter) ->
 
     assert adapter._is_reply_disclosure_control(Control()) is False
     assert adapter._is_reply_disclosure_control(
+        Control(text="Click Show probable spam to continue")
+    ) is False
+    assert adapter._is_reply_disclosure_control(
         Control(test_id="like", text="Show probable spam")
     ) is False
 
@@ -848,7 +851,46 @@ def test_reply_confirmation_rejects_identical_text_from_another_account(
         "https://x.com/source_user/status/123",
     ]
     assert manager.driver.page_load_timeouts == [
-        adapter.REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
+    ]
+
+
+def test_like_confirmation_uses_one_bounded_read_only_navigation(adapter) -> None:
+    class Driver:
+        def __init__(self):
+            self.page_load_timeouts: list[float] = []
+
+        def set_page_load_timeout(self, value: float):
+            self.page_load_timeouts.append(value)
+
+        def find_elements(self, _by: str, selector: str):
+            assert selector == "//*[@data-testid='unlike']"
+            return [object()]
+
+    class Manager:
+        def __init__(self):
+            self.driver = Driver()
+            self.navigations: list[str] = []
+
+        def get_driver(self):
+            return self.driver
+
+        def navigate_to(self, url: str, ensure_driver: bool = True):
+            assert ensure_driver is False
+            self.navigations.append(url)
+            return True
+
+    manager = Manager()
+
+    result = adapter._confirmed_like_url(
+        manager, "https://x.com/source_user/status/123"
+    )
+
+    assert result == "https://x.com/source_user/status/123"
+    assert manager.navigations == ["https://x.com/source_user/status/123"]
+    assert manager.driver.page_load_timeouts == [
+        adapter.CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
         adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
     ]
 
@@ -860,7 +902,7 @@ def test_dashboard_reply_confirmation_only_uses_the_read_only_proof_path(
 
     class Pool:
         @asynccontextmanager
-        async def session(self, account: str):
+        async def confirmation_session(self, account: str):
             assert account == "expected_user"
             yield "verified-browser"
 
@@ -928,7 +970,7 @@ def test_dashboard_reply_confirmation_reports_hidden_spam_proof(
 
     class Pool:
         @asynccontextmanager
-        async def session(self, account: str):
+        async def confirmation_session(self, account: str):
             assert account == "expected_user"
             yield manager
 
@@ -1313,6 +1355,127 @@ def test_wrong_handle_fails_closed_before_browser_action(adapter, monkeypatch) -
     with pytest.raises(adapter.WrongAccountError, match="different_user"):
         manager.ensure_expected_handle(timeout=0)
     assert manager.driver.current == "owned-tab"
+
+
+def test_confirmation_identity_proof_caps_home_navigation_before_polling(adapter) -> None:
+    class SwitchTo:
+        def __init__(self, driver):
+            self.driver = driver
+
+        def window(self, handle):
+            self.driver.current = handle
+
+    class FakeDriver:
+        window_handles = ["owned-tab"]
+
+        def __init__(self):
+            self.current = "owned-tab"
+            self.switch_to = SwitchTo(self)
+            self.page_load_timeouts: list[float] = []
+
+        def set_page_load_timeout(self, value: float):
+            self.page_load_timeouts.append(value)
+
+        def get(self, url):
+            assert url == adapter.X_HOME_URL
+            assert self.current == "owned-tab"
+
+        def execute_script(self, script):
+            assert script == adapter.SELENIUM_IDENTITY_SCRIPT
+            return {
+                "url": "https://x.com/home",
+                "app_ready": True,
+                "profile_href": "/expected_user",
+                "account_switcher_text": "",
+            }
+
+    manager = adapter.SafeAttachedBrowserManager.__new__(
+        adapter.SafeAttachedBrowserManager
+    )
+    manager.driver = FakeDriver()
+    manager._owned_handle = "owned-tab"
+    manager.expected_handle = "expected_user"
+    manager.logged_in_handle = None
+
+    assert (
+        manager.ensure_expected_handle(
+            timeout=adapter.CONFIRMATION_IDENTITY_TIMEOUT_SECONDS,
+            page_load_timeout=adapter.CONFIRMATION_IDENTITY_TIMEOUT_SECONDS,
+        )
+        == "expected_user"
+    )
+    assert 0 < manager.driver.page_load_timeouts[0] <= (
+        adapter.CONFIRMATION_IDENTITY_TIMEOUT_SECONDS
+    )
+    assert manager.driver.page_load_timeouts[-1] == (
+        adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS
+    )
+
+
+def test_confirmation_session_uses_one_bounded_fresh_identity_check(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[object] = []
+
+    class Manager:
+        def get_driver(
+            self,
+            *,
+            identity_timeout: float,
+            identity_page_load_timeout: float,
+        ):
+            calls.append(
+                (
+                    "identity",
+                    identity_timeout,
+                    identity_page_load_timeout,
+                )
+            )
+
+        def close_driver(self):
+            calls.append("close-target")
+
+    manager = Manager()
+    pool = adapter.VerifiedSessionPool.__new__(adapter.VerifiedSessionPool)
+    pool._browser_factory = lambda account: calls.append(("factory", account)) or manager
+    pool.config_loader = object()
+    pool.find_account_dict = lambda account: {"account_id": account}
+
+    async def unexpected_acquire(_account: str):
+        pytest.fail("confirmation must not create a cached SessionPool entry")
+
+    pool.acquire = unexpected_acquire
+    monkeypatch.setattr(
+        adapter,
+        "acquire_browser_action_lock",
+        lambda timeout_seconds: calls.append(("lock", timeout_seconds))
+        or SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "release_browser_action_lock",
+        lambda _handle: calls.append("release-lock"),
+    )
+
+    async def run() -> None:
+        async with pool.confirmation_session("expected_user") as current:
+            assert current is manager
+            calls.append("read-only-proof")
+
+    asyncio.run(run())
+
+    assert calls == [
+        ("lock", adapter.CONFIRMATION_PROCESS_LOCK_TIMEOUT_SECONDS),
+        ("factory", {"account_id": "expected_user"}),
+        (
+            "identity",
+            adapter.CONFIRMATION_IDENTITY_TIMEOUT_SECONDS,
+            adapter.CONFIRMATION_IDENTITY_TIMEOUT_SECONDS,
+        ),
+        "read-only-proof",
+        "close-target",
+        "release-lock",
+    ]
 
 
 def test_verified_session_holds_the_cross_process_lock_through_the_action(
