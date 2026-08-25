@@ -38,7 +38,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from xuse import __version__ as upstream_version
 from xuse.core.config_loader import ConfigLoader
-from xuse.features.engagement import TweetEngagement
 from xuse.features.scraper import TweetScraper
 from xuse.features.scraper.parsing import find_article_with_status_id
 from xuse.mcp import actions
