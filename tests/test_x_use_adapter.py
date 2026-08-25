@@ -976,6 +976,48 @@ def test_like_confirmation_uses_one_bounded_read_only_navigation(adapter) -> Non
     ]
 
 
+def test_like_confirmation_waits_for_delayed_target_toolbar(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Driver:
+        def __init__(self):
+            self.page_load_timeouts: list[float] = []
+            self.unlike_polls = 0
+
+        def set_page_load_timeout(self, value: float):
+            self.page_load_timeouts.append(value)
+
+        def find_elements(self, _by: str, selector: str):
+            assert selector == "//*[@data-testid='unlike']"
+            self.unlike_polls += 1
+            return [object()] if self.unlike_polls > 2 else []
+
+    class Manager:
+        def __init__(self):
+            self.driver = Driver()
+            self.navigations: list[str] = []
+
+        def navigate_to(self, url: str, ensure_driver: bool = True):
+            assert ensure_driver is False
+            self.navigations.append(url)
+            return True
+
+    manager = Manager()
+    sleeps = install_confirmation_clock(adapter, monkeypatch)
+
+    result = adapter._confirmed_like_url(
+        manager, "https://x.com/source_user/status/123"
+    )
+
+    assert result == "https://x.com/source_user/status/123"
+    assert manager.navigations == ["https://x.com/source_user/status/123"]
+    assert manager.driver.unlike_polls == 3
+    assert sleeps == [
+        adapter.CONFIRMATION_REPLY_DISCOVERY_POLL_SECONDS,
+        adapter.CONFIRMATION_REPLY_DISCOVERY_POLL_SECONDS,
+    ]
+
+
 def test_dashboard_reply_confirmation_only_uses_the_read_only_proof_path(
     adapter, monkeypatch: pytest.MonkeyPatch
 ) -> None:

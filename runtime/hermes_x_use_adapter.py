@@ -1427,8 +1427,18 @@ def _confirmed_like_url(browser_manager: Any, target_url: str) -> str | None:
             page_load_timeout=CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
         ):
             return None
-        buttons = driver.find_elements("xpath", "//*[@data-testid='unlike']")
-        return target_url if buttons else None
+        deadline = time.monotonic() + CONFIRMATION_REPLY_DISCOVERY_TIMEOUT_SECONDS
+        while True:
+            buttons = driver.find_elements("xpath", "//*[@data-testid='unlike']")
+            if buttons:
+                return target_url
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            # X often commits the page before it renders the target tweet's
+            # toolbar. This is the same bounded, read-only DOM poll used for
+            # reply proof; it never sends a second like or navigates again.
+            time.sleep(min(CONFIRMATION_REPLY_DISCOVERY_POLL_SECONDS, remaining))
     except Exception:
         return None
     finally:
