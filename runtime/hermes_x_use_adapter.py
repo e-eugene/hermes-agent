@@ -1060,8 +1060,13 @@ def _like_tweet_outcome(
         if not browser_manager.navigate_to(tweet_url):
             return "target_not_found"
         driver = browser_manager.get_driver()
-        article = find_article_with_status_id(driver, tweet_id)
-        if article is None:
+        try:
+            article = WebDriverWait(driver, 15, poll_frequency=0.25).until(
+                lambda current_driver: (
+                    find_article_with_status_id(current_driver, tweet_id) or False
+                )
+            )
+        except TimeoutException:
             return "target_not_found"
         if article.find_elements(By.XPATH, './/button[@data-testid="unlike"]'):
             return "already_liked"

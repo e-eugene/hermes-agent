@@ -785,6 +785,44 @@ def test_like_tweet_click_without_dom_flip_is_accepted_for_read_only_confirmatio
     asyncio.run(adapter.shutdown_safe_server(server))
 
 
+def test_like_waits_for_exact_status_article_after_x_navigation(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[float, float | None]] = []
+
+    class Browser:
+        def navigate_to(self, _url: str) -> bool:
+            return True
+
+        def get_driver(self):
+            return object()
+
+    class Article:
+        def find_elements(self, _by, _xpath):
+            return [object()]
+
+    class Wait:
+        def __init__(self, _driver, timeout: float, poll_frequency: float | None = None):
+            calls.append((timeout, poll_frequency))
+
+        def until(self, predicate):
+            value = predicate(object())
+            assert value is article
+            return value
+
+    article = Article()
+    monkeypatch.setattr(adapter, "WebDriverWait", Wait)
+    monkeypatch.setattr(adapter, "find_article_with_status_id", lambda *_args: article)
+
+    assert (
+        adapter._like_tweet_outcome(
+            Browser(), tweet_id="123", tweet_url="https://x.com/i/web/status/123"
+        )
+        == "already_liked"
+    )
+    assert calls == [(15, 0.25)]
+
+
 def test_mcp_draft_readers_revalidate_persistent_records_and_preview(adapter) -> None:
     server = adapter.create_safe_server()
     store = server.xuse_ctx.draft_store
