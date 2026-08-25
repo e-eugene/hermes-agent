@@ -925,13 +925,25 @@ def _direct_publish_envelope(
     if tweet_url is not None:
         payload["tweet_url"] = tweet_url
     if action == "reply_to_tweet":
-        if not isinstance(comment_url, str) or not isinstance(comment_text, str):
-            raise RuntimeError("x-use could not confirm the published reply URL")
-        canonical_comment_url, comment_id = canonical_x_status_url(comment_url)
-        if comment_id == tweet_id:
-            raise RuntimeError("x-use returned the reply target as the published reply")
-        payload["comment_url"] = canonical_comment_url
-        payload["comment_text"] = comment_text
+        # ``exec_reply`` is proof that X accepted the write. A public reply can
+        # take time to reach the profile DOM, so never reclassify an accepted
+        # action as a failed publish merely because a permalink is not visible.
+        payload["receipt"] = {
+            "action": "reply",
+            "status": "accepted",
+            "target_tweet_url": tweet_url,
+            "reply_text": comment_text,
+        }
+        if isinstance(comment_url, str):
+            canonical_comment_url, comment_id = canonical_x_status_url(comment_url)
+            if comment_id != tweet_id:
+                payload["receipt"] = {
+                    **payload["receipt"],
+                    "status": "confirmed",
+                    "permalink": canonical_comment_url,
+                }
+                payload["comment_url"] = canonical_comment_url
+                payload["comment_text"] = comment_text
     return ok_(**payload)
 
 
@@ -985,6 +997,18 @@ def _confirmed_direct_reply_url(
     return None
 
 
+def _confirmed_like_url(browser_manager: Any, target_url: str) -> str | None:
+    """Read-only proof that the target currently exposes its unlike control."""
+    if not browser_manager.navigate_to(target_url):
+        return None
+    try:
+        driver = browser_manager.get_driver()
+        buttons = driver.find_elements("xpath", "//*[@data-testid='unlike']")
+        return target_url if buttons else None
+    except Exception:
+        return None
+
+
 async def confirmed_direct_reply_url(
     ctx: Ctx,
     *,
@@ -1004,6 +1028,45 @@ async def confirmed_direct_reply_url(
         )
     raise_deferred_cancellation(cancellation)
     return result
+
+
+async def confirm_dashboard_action(
+    *, action: str, target_tweet_url: str, reply_text: str | None = None
+) -> dict[str, Any]:
+    """Read-only confirmation API used after an already accepted X action.
+
+    It deliberately creates no drafts and calls no publishing tool. Diagnostic
+    codes are fixed, safe categories rather than browser exception text.
+    """
+    try:
+        target_url, target_id = canonical_x_status_url(target_tweet_url)
+        account_id = load_expected_handle()
+    except Exception:
+        return {"status": "failed", "diagnostic_code": "invalid_receipt"}
+    if action not in {"like", "reply"}:
+        return {"status": "failed", "diagnostic_code": "invalid_action"}
+    if action == "reply" and (not isinstance(reply_text, str) or not reply_text.strip()):
+        return {"status": "failed", "diagnostic_code": "invalid_receipt"}
+    try:
+        loader = runtime_config_loader()
+        async with session_pool(loader).session(account_id) as browser_manager:
+            if action == "like":
+                result, cancellation = await definitive_to_thread(
+                    _confirmed_like_url, browser_manager, target_url
+                )
+            else:
+                result, cancellation = await definitive_to_thread(
+                    _confirmed_direct_reply_url,
+                    browser_manager, account_id, target_id, reply_text.strip(),
+                )
+        raise_deferred_cancellation(cancellation)
+    except (WrongAccountError, SessionNotVerifiedError):
+        return {"status": "failed", "diagnostic_code": "session_error"}
+    except Exception:
+        return {"status": "pending", "diagnostic_code": "browser_unavailable"}
+    if result:
+        return {"status": "confirmed", "permalink": result}
+    return {"status": "pending", "diagnostic_code": "not_visible_yet"}
 
 
 def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
@@ -1333,6 +1396,11 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
                 tweet_url=canonical_url,
                 success=True,
                 already_liked=True,
+                outcome="already_liked",
+                receipt={
+                    "action": "like", "status": "confirmed",
+                    "target_tweet_url": canonical_url, "permalink": canonical_url,
+                },
             )
 
         async with ctx.session_pool.session(account_id) as browser_manager:
@@ -1363,6 +1431,11 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
             tweet_url=canonical_url,
             success=True,
             already_liked=False,
+            outcome="clicked_confirmed",
+            receipt={
+                "action": "like", "status": "confirmed",
+                "target_tweet_url": canonical_url, "permalink": canonical_url,
+            },
         )
 
     @server.tool(name="reply_to_tweet", annotations=PUBLISHES_TO_X)
@@ -1392,19 +1465,12 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
                 reply_text=exact_text,
                 tweet_id=tweet_id,
             )
-            comment_url = await confirmed_direct_reply_url(
-                ctx,
-                account_id=account_id,
-                target_tweet_id=tweet_id,
-                reply_text=exact_text,
-            )
             return _direct_publish_envelope(
                 account_id,
                 "reply_to_tweet",
                 result,
                 tweet_url=canonical_url,
                 tweet_id=tweet_id,
-                comment_url=comment_url,
                 comment_text=exact_text,
             )
         draft = ctx.draft_store.create(

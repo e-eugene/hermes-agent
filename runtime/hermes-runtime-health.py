@@ -117,6 +117,7 @@ def capabilities() -> list[str]:
         # versions and operators that already check it continue to work.
         "x_use_like",
         "x_like_tweet",
+        "x_action_receipts_v2",
         *base,
     ]
     if os.environ.get("HERMES_X_DIRECT_POSTING_ENABLED", "").strip().lower() in {
@@ -524,6 +525,34 @@ class Handler(BaseHTTPRequestHandler):
         ):
             status, payload = x_use_draft_action(parts[2], parts[3])
             self.respond(status, payload)
+            return
+        if parts == ["x-use", "actions", "confirm"]:
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if content_type != "application/json" or length <= 0 or length > 8192:
+                self.respond(422, {"status": "failed", "diagnostic_code": "invalid_receipt"})
+                return
+            try:
+                payload = json.loads(self.rfile.read(length))
+            except (UnicodeDecodeError, ValueError):
+                self.respond(422, {"status": "failed", "diagnostic_code": "invalid_receipt"})
+                return
+            if not isinstance(payload, dict):
+                self.respond(422, {"status": "failed", "diagnostic_code": "invalid_receipt"})
+                return
+            try:
+                from hermes_x_use_adapter import confirm_dashboard_action
+                result = asyncio.run(confirm_dashboard_action(
+                    action=payload.get("action"),
+                    target_tweet_url=payload.get("target_tweet_url"),
+                    reply_text=payload.get("reply_text"),
+                ))
+            except Exception:
+                result = {"status": "pending", "diagnostic_code": "browser_unavailable"}
+            self.respond(200, result)
             return
         self.respond(404, {"status": "not_found"})
 
