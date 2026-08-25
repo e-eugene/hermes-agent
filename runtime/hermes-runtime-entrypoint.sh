@@ -259,7 +259,6 @@ path = Path("/opt/data/config.yaml")
 config = yaml.safe_load(path.read_text()) or {}
 config.setdefault("platform_toolsets", {})["api_server"] = [
     "terminal",
-    "browser",
     "x_use",
 ]
 browser = config.setdefault("browser", {})
@@ -285,6 +284,10 @@ direct_posting_enabled = (
     os.environ.get("HERMES_X_DIRECT_POSTING_ENABLED", "").strip().lower()
     in {"1", "true", "yes", "on"}
 )
+low_data_enabled = (
+    os.environ.get("HERMES_X_LOW_DATA_MODE", "true").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
 mcp_env = {
     "NO_PROXY": "127.0.0.1,localhost,::1",
     "no_proxy": "127.0.0.1,localhost,::1",
@@ -294,6 +297,7 @@ mcp_env = {
     "HERMES_X_DIRECT_POSTING_ENABLED": (
         "true" if direct_posting_enabled else "false"
     ),
+    "HERMES_X_LOW_DATA_MODE": "true" if low_data_enabled else "false",
 }
 proxy_url = os.environ.get("RESIDENTIAL_PROXY_URL")
 network_mode = os.environ.get("HERMES_BROWSER_NETWORK_MODE")

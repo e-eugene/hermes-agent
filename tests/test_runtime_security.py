@@ -126,6 +126,19 @@ def test_public_image_contains_only_private_remote_chromium_endpoints() -> None:
     assert "hermes-browser-gateway" in content
     assert "hermes-browser-network-status" in content
     assert "EXPOSE 6081 8642 8643 9120" in content
+    assert "HERMES_X_LOW_DATA_MODE=true" in content
+    assert "HERMES_RESIDENTIAL_PROXY_LOG_TRAFFIC=true" in content
+
+
+def test_assigned_proxy_chromium_starts_in_low_data_mode_by_default() -> None:
+    content = (ROOT / "runtime" / "hermes-browser-supervisor.sh").read_text()
+
+    assert 'HERMES_X_LOW_DATA_MODE:-true' in content
+    assert 'browser_network_mode}" == "assigned_proxy"' in content
+    assert "--blink-settings=imagesEnabled=false" in content
+    assert "--autoplay-policy=user-gesture-required" in content
+    assert "--disable-background-networking" in content
+    assert "--dns-prefetch-disable" in content
 
 
 def test_x_use_is_pinned_isolated_and_uses_system_chromedriver() -> None:
@@ -174,6 +187,7 @@ def test_hermes_native_mcp_has_a_defense_in_depth_allowlist() -> None:
     assert 'os.environ.get("HERMES_X_DIRECT_POSTING_ENABLED", "")' in content
     assert '"HERMES_X_DIRECT_POSTING_ENABLED": (' in content
     assert '"true" if direct_posting_enabled else "false"' in content
+    assert '"HERMES_X_LOW_DATA_MODE": "true" if low_data_enabled else "false"' in content
     assert '"HERMES_BROWSER_NETWORK_MODE": "assigned_proxy"' in content
     assert '"HERMES_RESIDENTIAL_PROXY_PORT": str(parsed_proxy.port)' in content
     assert '"RESIDENTIAL_PROXY_URL": proxy_url' in content
@@ -197,7 +211,7 @@ def test_installed_hermes_mcp_preflight_gates_runtime_startup() -> None:
     assert "write_marker()" in preflight
 
 
-def test_api_keeps_existing_tools_and_adds_x_use() -> None:
+def test_api_exposes_terminal_and_x_use_without_model_facing_browser() -> None:
     content = ENTRYPOINT.read_text()
 
     assert 'config.setdefault("platform_toolsets", {})["api_server"] = [' in content
@@ -205,7 +219,7 @@ def test_api_keeps_existing_tools_and_adds_x_use() -> None:
         'config.setdefault("platform_toolsets", {})["api_server"] = [', 1
     )[1].split("]", 1)[0]
     assert '"terminal"' in api_block
-    assert '"browser"' in api_block
+    assert '"browser"' not in api_block
     assert '"x_use"' in api_block
     assert 'platform_toolsets["cli"]' not in content
 

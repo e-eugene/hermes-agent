@@ -6,6 +6,8 @@ browser_screen="${HERMES_BROWSER_SCREEN:-1440x900x24}"
 browser_profile="${HERMES_BROWSER_PROFILE_DIR:-/opt/data/browser-profile}"
 browser_state="${HERMES_BROWSER_STATE_DIR:-/opt/data/browser}"
 browser_proxy_args=()
+browser_low_data_args=()
+browser_disable_features="Translate,MediaRouter"
 browser_network_mode="${HERMES_BROWSER_NETWORK_MODE:-}"
 
 if [[ -z "${browser_network_mode}" ]]; then
@@ -34,6 +36,31 @@ case "${browser_network_mode}" in
     exit 1
     ;;
 esac
+
+case "${HERMES_X_LOW_DATA_MODE:-true}" in
+  0|false|FALSE|False|no|NO|No|off|OFF|Off)
+    browser_low_data_enabled="false"
+    ;;
+  *)
+    browser_low_data_enabled="true"
+    ;;
+esac
+
+if [[ "${browser_network_mode}" == "assigned_proxy" && "${browser_low_data_enabled}" == "true" ]]; then
+  browser_disable_features="Translate,MediaRouter,PreloadMediaEngagementData,AutoplayIgnoreWebAudio,InterestFeedContentSuggestions,OptimizationHints,SpeculationRulesPrefetchProxy,Prerender2"
+  browser_low_data_args=(
+    "--blink-settings=imagesEnabled=false"
+    "--autoplay-policy=user-gesture-required"
+    "--disable-background-networking"
+    "--disable-sync"
+    "--disable-default-apps"
+    "--disable-extensions"
+    "--disable-component-extensions-with-background-pages"
+    "--disable-client-side-phishing-detection"
+    "--disable-domain-reliability"
+    "--dns-prefetch-disable"
+  )
+fi
 
 mkdir -p "${browser_profile}" "${browser_state}"
 chmod 0700 "${browser_profile}"
@@ -85,13 +112,14 @@ while true; do
     --no-first-run \
     --no-default-browser-check \
     --disable-component-update \
-    --disable-features=Translate,MediaRouter \
+    "--disable-features=${browser_disable_features}" \
     --remote-allow-origins='*' \
     --remote-debugging-address=127.0.0.1 \
     --remote-debugging-port=9222 \
     --user-data-dir="${browser_profile}" \
     --window-size=1440,900 \
     "${browser_proxy_args[@]}" \
+    "${browser_low_data_args[@]}" \
     about:blank \
     >"${browser_state}/chromium.log" 2>&1 &
   chromium_pid=$!

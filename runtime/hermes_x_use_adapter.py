@@ -58,6 +58,7 @@ from xuse.mcp.tools import guard, ok_
 from hermes_x_use_common import (
     IDENTITY_EXPRESSION,
     MAX_X_TEXT_CHARS,
+    MEDIA_BLOCKED_URL_PATTERNS,
     X_HOME_URL,
     X_USE_ACCOUNTS_PATH,
     X_USE_DATA_DIR,
@@ -71,6 +72,7 @@ from hermes_x_use_common import (
     has_credential_like_content,
     live_status,
     load_expected_handle,
+    low_data_mode,
     normalize_handle,
     require_assigned_proxy_bridge,
     release_browser_action_lock,
@@ -142,6 +144,25 @@ CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
 SELENIUM_IDENTITY_SCRIPT = f"return ({IDENTITY_EXPRESSION.strip()});"
 logger = logging.getLogger(__name__)
 X_STATUS_LINK_PATTERN = re.compile(r"^/[^/]+/status/(?P<tweet_id>[0-9]{1,30})$")
+
+
+def apply_selenium_low_data_controls(driver: Any) -> None:
+    """Apply per-target CDP media blocking before any x-use-owned navigation."""
+
+    if not low_data_mode():
+        return
+    execute_cdp_cmd = getattr(driver, "execute_cdp_cmd", None)
+    if not callable(execute_cdp_cmd):
+        return
+    execute_cdp_cmd("Network.enable", {})
+    execute_cdp_cmd(
+        "Network.setBlockedURLs",
+        {"urls": list(MEDIA_BLOCKED_URL_PATTERNS)},
+    )
+
+
+def should_attach_images(include_images: bool) -> bool:
+    return bool(include_images) and not low_data_mode()
 
 
 def resolve_runtime_account(ctx: Ctx, account: str | None):
@@ -247,6 +268,12 @@ class SafeAttachedBrowserManager:
             raise RuntimeError("x-use browser target was closed")
         self.driver.switch_to.window(self._owned_handle)
 
+    def _apply_low_data_controls(self) -> None:
+        if self.driver is None:
+            raise RuntimeError("x-use browser target is unavailable")
+        self._switch_to_owned()
+        apply_selenium_low_data_controls(self.driver)
+
     def _create_owned_target(self) -> str:
         assert self.driver is not None
         before = set(self.driver.window_handles)
@@ -269,6 +296,7 @@ class SafeAttachedBrowserManager:
     def get_driver(self):
         if self.driver is not None and self.is_driver_active():
             self._switch_to_owned()
+            self._apply_low_data_controls()
             return self.driver
         if self.driver is not None:
             self.close_driver()
@@ -284,6 +312,7 @@ class SafeAttachedBrowserManager:
             driver.set_script_timeout(30)
             self._owned_handle = self._create_owned_target()
             self._switch_to_owned()
+            self._apply_low_data_controls()
             self.ensure_expected_handle()
             return driver
         except Exception:
@@ -325,6 +354,7 @@ class SafeAttachedBrowserManager:
                 if driver is None:
                     return False
                 self._switch_to_owned()
+                apply_selenium_low_data_controls(driver)
                 driver.get(url)
                 return True
             except Exception as exc:
@@ -353,6 +383,7 @@ class SafeAttachedBrowserManager:
         if self.driver is None:
             raise SessionNotVerifiedError("Persistent Chromium is unavailable")
         self._switch_to_owned()
+        self._apply_low_data_controls()
         self.driver.get(X_HOME_URL)
         deadline = time.monotonic() + max(0, timeout)
         actual: str | None = None
@@ -1248,7 +1279,7 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
             count=len(tweets),
             tweets=[dump_tweet(tweet) for tweet in tweets],
         )
-        if not include_images:
+        if not should_attach_images(include_images):
             return envelope
         return await attach_search_images(envelope, tweets)
 
@@ -1287,7 +1318,7 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
             count=len(tweets),
             tweets=[dump_tweet(tweet) for tweet in tweets],
         )
-        if not include_images:
+        if not should_attach_images(include_images):
             return envelope
         return await attach_search_images(envelope, tweets)
 
@@ -1331,7 +1362,7 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
     async def safe_get_tweet(
         tweet_url: str,
         account: str | None = None,
-        include_images: bool = True,
+        include_images: bool = False,
     ) -> dict[str, Any]:
         """Fetch one tweet after replacing caller input with its canonical X URL."""
 
@@ -1352,7 +1383,7 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
             media=media_envelope(original),
             persona=getattr(model, "persona", None),
         )
-        if not include_images:
+        if not should_attach_images(include_images):
             return envelope
         images = await asyncio.to_thread(images_for_tweet, original)
         return with_images(envelope, images)
@@ -1362,7 +1393,7 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
     async def safe_prepare_reply(
         tweet_url: str,
         account: str | None = None,
-        include_images: bool = True,
+        include_images: bool = False,
     ) -> dict[str, Any]:
         """Prepare reply context for one canonical X status URL only."""
 
@@ -1389,7 +1420,7 @@ def _register_safe_stage_tools(server: Any, ctx: Ctx) -> None:
                 "reply_to_tweet with the reviewed text."
             ),
         )
-        if not include_images:
+        if not should_attach_images(include_images):
             return envelope
         images = await asyncio.to_thread(images_for_tweet, original)
         return with_images(envelope, images)

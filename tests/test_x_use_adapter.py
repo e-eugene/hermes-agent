@@ -82,6 +82,48 @@ def call_tool(server, name: str, arguments: dict[str, object]) -> dict[str, obje
     return json.loads(content[0].text)
 
 
+def install_single_tweet_fixture(adapter, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    calls: list[str] = []
+
+    class FakeScraper:
+        def __init__(self, browser_manager, account_id):
+            assert account_id == "expected_user"
+
+        def scrape_tweets_from_url(self, tweet_url, kind, limit):
+            assert kind == "tweet"
+            assert limit == adapter.MAX_SINGLE_TWEET_CANDIDATES
+            calls.append(tweet_url)
+            return [
+                SimpleNamespace(
+                    tweet_id="123",
+                    user_handle="@Some_User",
+                    text_content="tweet text",
+                    like_count=1,
+                    retweet_count=2,
+                    reply_count=3,
+                    view_count=4,
+                    media=[],
+                )
+            ]
+
+    class FakePool:
+        idle_timeout_seconds = 600
+
+        def find_account_dict(self, account_id):
+            return {"account_id": account_id, "is_active": True}
+
+        @asynccontextmanager
+        async def session(self, account_id):
+            yield object()
+
+        async def close_all(self):
+            return None
+
+    monkeypatch.setattr(adapter, "TweetScraper", FakeScraper)
+    monkeypatch.setattr(adapter, "session_pool", lambda loader: FakePool())
+    return calls
+
+
 @pytest.mark.parametrize(
     ("snapshot", "expected"),
     [
@@ -257,6 +299,62 @@ def test_single_tweet_tools_navigate_only_to_canonical_x_url(
     assert result["ok"] is True
     assert result["tweet_url"] == "https://x.com/i/web/status/123"
     assert calls == [("https://x.com/i/web/status/123", "123")]
+    asyncio.run(adapter.shutdown_safe_server(server))
+
+
+@pytest.mark.parametrize("tool_name", ["get_tweet", "prepare_reply"])
+def test_single_tweet_tools_do_not_fetch_images_by_default(
+    adapter, monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    calls = install_single_tweet_fixture(adapter, monkeypatch)
+    monkeypatch.setattr(
+        adapter,
+        "images_for_tweet",
+        lambda _tweet: pytest.fail("default single-tweet calls must not fetch images"),
+    )
+    server = adapter.create_safe_server()
+
+    result = call_tool(
+        server,
+        tool_name,
+        {
+            "account": "expected_user",
+            "tweet_url": "https://x.com/some_user/status/123",
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["text_content"] == "tweet text"
+    assert calls == ["https://x.com/some_user/status/123"]
+    asyncio.run(adapter.shutdown_safe_server(server))
+
+
+@pytest.mark.parametrize("tool_name", ["get_tweet", "prepare_reply"])
+def test_low_data_mode_ignores_include_images_true_without_failing(
+    adapter, monkeypatch: pytest.MonkeyPatch, tool_name: str
+) -> None:
+    calls = install_single_tweet_fixture(adapter, monkeypatch)
+    monkeypatch.setenv("HERMES_X_LOW_DATA_MODE", "true")
+    monkeypatch.setattr(
+        adapter,
+        "images_for_tweet",
+        lambda _tweet: pytest.fail("low-data mode must not download images"),
+    )
+    server = adapter.create_safe_server()
+
+    result = call_tool(
+        server,
+        tool_name,
+        {
+            "account": "expected_user",
+            "tweet_url": "https://x.com/some_user/status/123",
+            "include_images": True,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["text_content"] == "tweet text"
+    assert calls == ["https://x.com/some_user/status/123"]
     asyncio.run(adapter.shutdown_safe_server(server))
 
 
@@ -1040,6 +1138,42 @@ def test_crashed_owned_target_is_replaced_before_the_next_action(
     assert ("close", "owned-tab") in calls
     assert "old-service-stop" in calls
     assert "verify" in calls
+
+
+def test_navigation_applies_low_data_blocklist_before_page_load(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = "https://x.com/example/status/123"
+    calls: list[object] = []
+
+    class Driver:
+        current_url = target
+
+        def execute_cdp_cmd(self, method, params):
+            calls.append((method, params))
+            return {}
+
+        def get(self, url):
+            calls.append(("get", url))
+
+    manager = adapter.SafeAttachedBrowserManager.__new__(
+        adapter.SafeAttachedBrowserManager
+    )
+    driver = Driver()
+    monkeypatch.setattr(manager, "get_driver", lambda: driver)
+    monkeypatch.setattr(manager, "_switch_to_owned", lambda: calls.append("switch"))
+
+    assert manager.navigate_to(target) is True
+
+    assert calls[:4] == [
+        "switch",
+        ("Network.enable", {}),
+        (
+            "Network.setBlockedURLs",
+            {"urls": list(adapter.MEDIA_BLOCKED_URL_PATTERNS)},
+        ),
+        ("get", target),
+    ]
 
 
 def test_navigation_accepts_a_committed_page_after_a_transient_webdriver_error(

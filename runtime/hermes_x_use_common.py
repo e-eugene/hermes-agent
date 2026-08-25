@@ -33,6 +33,15 @@ ALLOWED_COOKIE_HOSTS = ("x.com", "twitter.com")
 REQUIRED_SESSION_COOKIES = frozenset({"auth_token", "ct0"})
 X_HOME_URL = "https://x.com/home"
 MAX_X_TEXT_CHARS = 270
+LOW_DATA_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+MEDIA_BLOCKED_URL_PATTERNS = (
+    "*://pbs.twimg.com/*",
+    "*://video.twimg.com/*",
+    "*://upload.twitter.com/*",
+    "*.mp4*",
+    "*.m3u8*",
+    "*.ts*",
+)
 _CREDENTIAL_PATTERNS = (
     re.compile(r"(?i)\bauth_token\b"),
     re.compile(r"(?i)(?:^|\W)ct0(?:$|\W)"),
@@ -122,6 +131,25 @@ def require_assigned_proxy_bridge() -> str:
     if os.environ.get("RESIDENTIAL_PROXY_URL") != expected:
         raise RuntimeConfigurationError("x-use loopback proxy bridge is unavailable")
     return expected
+
+
+def low_data_mode() -> bool:
+    value = os.environ.get("HERMES_X_LOW_DATA_MODE", "true").strip().lower()
+    return value not in LOW_DATA_FALSE_VALUES
+
+
+def apply_cdp_low_data_controls(client: Any, session_id: str) -> None:
+    """Block heavy media in one CDP target before navigating to X."""
+
+    if not low_data_mode():
+        return
+    client.request("Network.enable", session_id=session_id, timeout=5)
+    client.request(
+        "Network.setBlockedURLs",
+        {"urls": list(MEDIA_BLOCKED_URL_PATTERNS)},
+        session_id=session_id,
+        timeout=5,
+    )
 
 
 def acquire_browser_action_lock(timeout_seconds: float = 5.0):
@@ -543,6 +571,7 @@ def inspect_identity(client: CdpClient, *, timeout: float = 35) -> str | None:
                 "Target.attachToTarget", {"targetId": target_id, "flatten": True}
             )["sessionId"]
         )
+        apply_cdp_low_data_controls(client, session_id)
         client.request("Page.enable", session_id=session_id)
         client.request("Page.navigate", {"url": X_HOME_URL}, session_id=session_id)
         deadline = time.monotonic() + max(0, timeout)

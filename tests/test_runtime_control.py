@@ -27,6 +27,10 @@ def control(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("HERMES_RESIDENTIAL_PROXY_PORT", "8899")
     monkeypatch.setenv("RESIDENTIAL_PROXY_URL", "http://127.0.0.1:8899")
     monkeypatch.delenv("HERMES_X_DIRECT_POSTING_ENABLED", raising=False)
+    monkeypatch.setenv(
+        "HERMES_X_USE_STATUS_SNAPSHOT",
+        str(tmp_path / "x-use" / "status-cache.json"),
+    )
     marker = tmp_path / "native-mcp-ready.json"
     marker.write_text(
         json.dumps(
@@ -225,12 +229,10 @@ def test_x_use_session_import_never_echoes_cookie_values(
 
 @pytest.mark.parametrize("state", ["ready", "not_configured", "wrong_account"])
 def test_x_use_status_returns_200_for_every_valid_state_snapshot(
-    control, monkeypatch: pytest.MonkeyPatch, state: str
+    control, state: str
 ) -> None:
-    monkeypatch.setattr(
-        control,
-        "live_status",
-        lambda: {
+    control.write_x_use_snapshot(
+        {
             "status": state,
             "configured": True,
             "session_present": state != "not_configured",
@@ -239,7 +241,7 @@ def test_x_use_status_returns_200_for_every_valid_state_snapshot(
             "authenticated_handle": (
                 "different_user" if state == "wrong_account" else "expected_user"
             ),
-        },
+        }
     )
 
     http_status, payload = control.x_use_status()

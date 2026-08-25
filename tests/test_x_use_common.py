@@ -315,6 +315,9 @@ def test_identity_probe_owns_and_closes_only_its_temporary_target(common) -> Non
     assert common.inspect_identity(FakeClient(), timeout=0) == "expected_user"
     assert ("Target.closeTarget", {"targetId": "owned-target"}) in calls
     assert all("operator-target" not in str(call) for call in calls)
+    methods = [method for method, _params in calls]
+    assert methods.index("Network.enable") < methods.index("Page.navigate")
+    assert methods.index("Network.setBlockedURLs") < methods.index("Page.navigate")
 
 
 def test_identity_never_trusts_free_form_account_switcher_text(common) -> None:

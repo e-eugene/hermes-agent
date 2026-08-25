@@ -37,7 +37,6 @@ from hermes_x_use_common import (  # noqa: E402
     canonical_x_status_url,
     has_credential_like_content,
     import_session,
-    live_status,
     normalize_handle,
     require_assigned_proxy_bridge,
 )
@@ -60,6 +59,12 @@ X_USE_PREFLIGHT_MARKER = Path(
     os.environ.get(
         "HERMES_X_USE_PREFLIGHT_MARKER",
         "/tmp/hermes-x-use/native-mcp-ready.json",
+    )
+)
+X_USE_STATUS_SNAPSHOT = Path(
+    os.environ.get(
+        "HERMES_X_USE_STATUS_SNAPSHOT",
+        "/opt/data/x-use/status-cache.json",
     )
 )
 
@@ -156,13 +161,62 @@ def safe_x_use_status(payload: object) -> dict[str, object]:
     return result
 
 
-def x_use_status() -> tuple[int, dict[str, object]]:
+def write_x_use_snapshot(payload: object) -> dict[str, object]:
+    sanitized = safe_x_use_status(payload)
+    encoded = json.dumps(
+        sanitized,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    temporary = X_USE_STATUS_SNAPSHOT.with_name(
+        f".{X_USE_STATUS_SNAPSHOT.name}.{os.getpid()}.tmp"
+    )
     try:
-        payload = safe_x_use_status(live_status())
-    except RuntimeConfigurationError:
-        payload = safe_x_use_status(
-            {"status": "error", "configured": False, "session_present": False}
+        X_USE_STATUS_SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(X_USE_STATUS_SNAPSHOT.parent, 0o700)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
         )
+        try:
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, X_USE_STATUS_SNAPSHOT)
+        directory_descriptor = os.open(X_USE_STATUS_SNAPSHOT.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+    return sanitized
+
+
+def read_x_use_snapshot() -> dict[str, object]:
+    try:
+        metadata = X_USE_STATUS_SNAPSHOT.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_mode & 0o077
+            or metadata.st_size > 4096
+        ):
+            raise ValueError("invalid x-use status snapshot")
+        payload = json.loads(X_USE_STATUS_SNAPSHOT.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        payload = {
+            "status": "not_configured",
+            "configured": False,
+            "session_present": False,
+            "account_verified": False,
+        }
+    return safe_x_use_status(payload)
+
+
+def x_use_status() -> tuple[int, dict[str, object]]:
+    payload = read_x_use_snapshot()
     status = str(payload["status"])
     # Status is a state snapshot, not an action result. A missing session or a
     # wrong account is valid dashboard data and must not be discarded by an
@@ -172,7 +226,7 @@ def x_use_status() -> tuple[int, dict[str, object]]:
 
 def x_use_import_session(raw: bytes) -> tuple[int, dict[str, object]]:
     try:
-        payload = safe_x_use_status(import_session(raw))
+        payload = write_x_use_snapshot(import_session(raw))
     except SessionImportError:
         return 422, {
             "status": "error",
@@ -343,7 +397,23 @@ def x_use_draft_action(draft_id: str, action: str) -> tuple[int, dict[str, objec
             return 409, {"status": "error", "error": "Draft cannot be executed"}
         except Exception:
             return 503, {"status": "error", "error": "X action failed"}
-        return 200, safe_draft_action_payload(payload)
+        public_payload = safe_draft_action_payload(payload)
+        if action == "approve":
+            result = public_payload.get("result")
+            if isinstance(result, dict) and result.get("success") is True:
+                account = result.get("account")
+                if isinstance(account, str) and account:
+                    write_x_use_snapshot(
+                        {
+                            "status": "ready",
+                            "configured": True,
+                            "session_present": True,
+                            "account_verified": True,
+                            "expected_handle": account,
+                            "authenticated_handle": account,
+                        }
+                    )
+        return 200, public_payload
     finally:
         X_USE_ACTION_LOCK.release()
 

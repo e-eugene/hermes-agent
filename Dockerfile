@@ -83,7 +83,9 @@ ENV DISPLAY=:99 \
     AGENT_BROWSER_HEADED=true \
     BROWSER_CDP_URL=http://127.0.0.1:9222 \
     HERMES_X_USE_CONFIG_DIR=/tmp/hermes-x-use/config \
-    HERMES_X_USE_DATA_DIR=/opt/data/x-use
+    HERMES_X_USE_DATA_DIR=/opt/data/x-use \
+    HERMES_X_LOW_DATA_MODE=true \
+    HERMES_RESIDENTIAL_PROXY_LOG_TRAFFIC=true
 
 EXPOSE 6081 8642 8643 9120
 
