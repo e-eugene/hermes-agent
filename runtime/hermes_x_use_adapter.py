@@ -1151,14 +1151,16 @@ def _confirmed_direct_reply_url(
     target_tweet_id: str,
     reply_text: str,
     target_tweet_url: str | None = None,
+    confirmation_evidence: dict[str, Any] | None = None,
 ) -> str | None:
     """Find a public permalink for the accepted reply without another X write.
 
     A source-tweet scan is primary because X can hide the accepted reply behind
     its probable-spam disclosure. We inspect normal replies first, reveal only
-    the semantic disclosure control, then re-scan. The older profile timeline
-    is retained only as a compatibility fallback for ordinary replies that X
-    has not ranked into the source thread yet.
+    the semantic disclosure control, then re-scan. When that re-scan is the
+    proof, ``confirmation_evidence`` records it for the dashboard response.
+    The older profile timeline is retained only as a compatibility fallback for
+    ordinary replies that X has not ranked into the source thread yet.
     """
 
     source_url = target_tweet_url or f"https://x.com/i/web/status/{target_tweet_id}"
@@ -1188,6 +1190,13 @@ def _confirmed_direct_reply_url(
                         reply_text=reply_text,
                     )
                     if confirmed:
+                        if confirmation_evidence is not None:
+                            confirmation_evidence.update(
+                                {
+                                    "proof_source": "source_thread_hidden_spam",
+                                    "hidden_spam_disclosed": True,
+                                }
+                            )
                         return confirmed
             if browser_manager.navigate_to(profile_url):
                 confirmed = _reply_permalink_from_view(
@@ -1315,6 +1324,7 @@ async def confirm_dashboard_action(
         return {"status": "failed", "diagnostic_code": "invalid_action"}
     if action == "reply" and (not isinstance(reply_text, str) or not reply_text.strip()):
         return {"status": "failed", "diagnostic_code": "invalid_receipt"}
+    confirmation_evidence: dict[str, Any] = {}
     try:
         loader = runtime_config_loader()
         async with session_pool(loader).session(account_id) as browser_manager:
@@ -1330,6 +1340,7 @@ async def confirm_dashboard_action(
                     target_id,
                     reply_text.strip(),
                     target_url,
+                    confirmation_evidence,
                 )
         raise_deferred_cancellation(cancellation)
     except (WrongAccountError, SessionNotVerifiedError):
@@ -1337,7 +1348,14 @@ async def confirm_dashboard_action(
     except Exception:
         return {"status": "pending", "diagnostic_code": "browser_unavailable"}
     if result:
-        return {"status": "confirmed", "permalink": result}
+        response = {"status": "confirmed", "permalink": result}
+        # This is an observational receipt only: it is present exclusively
+        # when the source-thread proof followed a deliberate hidden-spam
+        # disclosure click. Normal/profile confirmation responses stay
+        # byte-for-byte compatible with the existing contract.
+        if confirmation_evidence.get("hidden_spam_disclosed") is True:
+            response.update(confirmation_evidence)
+        return response
     return {"status": "pending", "diagnostic_code": "not_visible_yet"}
 
 

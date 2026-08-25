@@ -707,6 +707,7 @@ def reply_confirmation_browser(
 
 def test_reply_confirmation_checks_source_thread_with_absolute_status_href(adapter) -> None:
     manager, driver = reply_confirmation_browser(adapter, reply_visible=True)
+    evidence: dict[str, object] = {}
 
     result = adapter._confirmed_direct_reply_url(
         manager,
@@ -714,11 +715,13 @@ def test_reply_confirmation_checks_source_thread_with_absolute_status_href(adapt
         "123",
         "Exact accepted reply",
         "https://x.com/source_user/status/123",
+        evidence,
     )
 
     assert result == "https://x.com/expected_user/status/456"
     assert manager.navigations == ["https://x.com/source_user/status/123"]
     assert driver.disclosure is None
+    assert evidence == {}
 
 
 @pytest.mark.parametrize(
@@ -734,6 +737,7 @@ def test_reply_confirmation_reveals_localized_hidden_spam_reply(
         disclosure_label=disclosure_label,
     )
     monkeypatch.setattr(adapter.time, "sleep", lambda _seconds: None)
+    evidence: dict[str, object] = {}
 
     result = adapter._confirmed_direct_reply_url(
         manager,
@@ -741,12 +745,17 @@ def test_reply_confirmation_reveals_localized_hidden_spam_reply(
         "123",
         "Exact accepted reply",
         "https://x.com/source_user/status/123",
+        evidence,
     )
 
     assert result == "https://x.com/expected_user/status/456"
     assert driver.disclosure is not None
     assert driver.disclosure.clicks == 1
     assert manager.navigations == ["https://x.com/source_user/status/123"]
+    assert evidence == {
+        "proof_source": "source_thread_hidden_spam",
+        "hidden_spam_disclosed": True,
+    }
 
 
 def test_reply_confirmation_does_not_click_an_unrecognized_disclosure_control(
@@ -828,7 +837,7 @@ def test_reply_confirmation_rejects_identical_text_from_another_account(
 def test_dashboard_reply_confirmation_only_uses_the_read_only_proof_path(
     adapter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple[object, str, str, str, str | None]] = []
+    calls: list[tuple[object, str, str, str, str | None, dict[str, object]]] = []
 
     class Pool:
         @asynccontextmanager
@@ -842,6 +851,7 @@ def test_dashboard_reply_confirmation_only_uses_the_read_only_proof_path(
         target_tweet_id: str,
         reply_text: str,
         target_tweet_url: str | None,
+        confirmation_evidence: dict[str, object],
     ):
         calls.append(
             (
@@ -850,6 +860,7 @@ def test_dashboard_reply_confirmation_only_uses_the_read_only_proof_path(
                 target_tweet_id,
                 reply_text,
                 target_tweet_url,
+                confirmation_evidence,
             )
         )
         return "https://x.com/expected_user/status/456"
@@ -882,8 +893,51 @@ def test_dashboard_reply_confirmation_only_uses_the_read_only_proof_path(
             "123",
             "Exact accepted reply",
             "https://x.com/source_user/status/123",
+            {},
         )
     ]
+
+
+def test_dashboard_reply_confirmation_reports_hidden_spam_proof(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, driver = reply_confirmation_browser(
+        adapter,
+        reply_visible=False,
+        disclosure_label="Show probable spam",
+    )
+
+    class Pool:
+        @asynccontextmanager
+        async def session(self, account: str):
+            assert account == "expected_user"
+            yield manager
+
+    async def unexpected_write(*_args, **_kwargs):
+        pytest.fail("receipt confirmation must not send an X write")
+
+    monkeypatch.setattr(adapter, "runtime_config_loader", lambda: object())
+    monkeypatch.setattr(adapter, "session_pool", lambda _loader: Pool())
+    monkeypatch.setattr(adapter.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(adapter.actions, "exec_reply", unexpected_write)
+    monkeypatch.setattr(adapter.actions, "exec_like", unexpected_write, raising=False)
+
+    result = asyncio.run(
+        adapter.confirm_dashboard_action(
+            action="reply",
+            target_tweet_url="https://x.com/source_user/status/123",
+            reply_text="Exact accepted reply",
+        )
+    )
+
+    assert result == {
+        "status": "confirmed",
+        "permalink": "https://x.com/expected_user/status/456",
+        "proof_source": "source_thread_hidden_spam",
+        "hidden_spam_disclosed": True,
+    }
+    assert driver.disclosure is not None
+    assert driver.disclosure.clicks == 1
 
 
 def test_like_tweet_executes_one_canonical_verified_like(

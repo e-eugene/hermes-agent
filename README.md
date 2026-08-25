@@ -96,7 +96,10 @@ The service on `8643` is private-only and requires `Authorization: Bearer
   `pending`, or a fixed diagnostic; it never creates a draft or sends another
   X action. Reply confirmation opens the source tweet first, scans normal
   replies, then reveals X's localized probable-spam reply disclosure when
-  present and matches the exact assigned-account reply text. The
+  present and matches the exact assigned-account reply text. If that disclosure
+  is actually used to find the reply, a successful response additionally carries
+  `proof_source: "source_thread_hidden_spam"` and
+  `hidden_spam_disclosed: true`. The
   `x_action_confirmation_hidden_spam_v1` capability is the version gate for
   that behavior.
 
