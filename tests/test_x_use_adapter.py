@@ -704,7 +704,7 @@ def reply_confirmation_browser(
             return True
 
         def get_driver(self):
-            return self.driver
+            pytest.fail("confirmation must not reattach a browser target")
 
     driver = Driver()
     return Manager(driver), driver
@@ -874,7 +874,7 @@ def test_like_confirmation_uses_one_bounded_read_only_navigation(adapter) -> Non
             self.navigations: list[str] = []
 
         def get_driver(self):
-            return self.driver
+            pytest.fail("confirmation must not reattach a browser target")
 
         def navigate_to(self, url: str, ensure_driver: bool = True):
             assert ensure_driver is False

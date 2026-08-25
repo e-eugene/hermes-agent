@@ -1315,10 +1315,13 @@ def _confirmed_direct_reply_url(
         source_url = f"https://x.com/i/web/status/{target_tweet_id}"
     driver: Any | None = None
     try:
-        # The surrounding verified session already proved the expected account,
-        # so this reads the same owned target without another identity/home
-        # navigation.
-        driver = browser_manager.get_driver()
+        # ``confirmation_session`` created and proved this owned target before
+        # yielding it. Do not call get_driver() here: a crashed target must
+        # become a pending proof, never trigger an unbounded reattach/identity
+        # cycle inside this one receipt observation.
+        driver = getattr(browser_manager, "driver", None)
+        if driver is None:
+            return None
         if not _navigate_for_confirmation(
             browser_manager,
             driver,
@@ -1369,7 +1372,11 @@ def _confirmed_like_url(browser_manager: Any, target_url: str) -> str | None:
     """Read-only proof that the target currently exposes its unlike control."""
     driver: Any | None = None
     try:
-        driver = browser_manager.get_driver()
+        # See the reply confirmation path: this must not recreate a browser
+        # target if the one-shot confirmation target became unavailable.
+        driver = getattr(browser_manager, "driver", None)
+        if driver is None:
+            return None
         if not _navigate_for_confirmation(
             browser_manager,
             driver,
