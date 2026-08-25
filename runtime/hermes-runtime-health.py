@@ -37,6 +37,7 @@ from hermes_x_use_common import (  # noqa: E402
     canonical_x_status_url,
     has_credential_like_content,
     import_session,
+    live_status,
     normalize_handle,
     require_assigned_proxy_bridge,
 )
@@ -221,7 +222,34 @@ def x_use_status() -> tuple[int, dict[str, object]]:
     # Status is a state snapshot, not an action result. A missing session or a
     # wrong account is valid dashboard data and must not be discarded by an
     # HTTP client that treats non-2xx responses as transport failures.
-    return (200 if status in {"ready", "not_configured", "wrong_account"} else 503, payload)
+    return (
+        200 if status in {"ready", "not_configured", "wrong_account"} else 503,
+        payload,
+    )
+
+
+def x_use_check() -> tuple[int, dict[str, object]]:
+    """Refresh the X-session snapshot with a live, read-only CDP probe.
+
+    ``/x-use/status`` intentionally remains cache-only so ordinary dashboard
+    polling does not create X traffic.  This endpoint is called only by an
+    explicit Recheck or immediately before a write-capable engagement, which
+    makes it safe to establish a truthful snapshot after a runtime restart.
+    """
+
+    try:
+        payload = write_x_use_snapshot(live_status())
+    except RuntimeConfigurationError:
+        payload = safe_x_use_status(
+            {"status": "error", "configured": False, "session_present": False}
+        )
+    except Exception:
+        payload = safe_x_use_status({"status": "error"})
+    status = str(payload["status"])
+    return (
+        200 if status in {"ready", "not_configured", "wrong_account"} else 503,
+        payload,
+    )
 
 
 def x_use_import_session(raw: bytes) -> tuple[int, dict[str, object]]:
@@ -248,7 +276,10 @@ def x_use_import_session(raw: bytes) -> tuple[int, dict[str, object]]:
     except Exception:
         return 503, safe_x_use_status({"status": "error"})
     status = str(payload["status"])
-    return ({"ready": 200, "not_configured": 409, "wrong_account": 409}.get(status, 503), payload)
+    return (
+        {"ready": 200, "not_configured": 409, "wrong_account": 409}.get(status, 503),
+        payload,
+    )
 
 
 def safe_drafts_payload(payload: object) -> dict[str, object]:
@@ -270,7 +301,9 @@ def safe_drafts_payload(payload: object) -> dict[str, object]:
             continue
         if status not in {"pending", "executed", "failed", "rejected"}:
             continue
-        raw_payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        raw_payload = (
+            item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        )
         text = raw_payload.get("text")
         if (
             not isinstance(text, str)
@@ -449,7 +482,11 @@ def safe_login(value: object) -> str | None:
     # Account names are model-visible metadata, but cap/control characters avoid
     # turning an unexpected helper response into an information-disclosure path.
     candidate = value.strip()
-    if not candidate or len(candidate) > 128 or any(ord(char) < 32 for char in candidate):
+    if (
+        not candidate
+        or len(candidate) > 128
+        or any(ord(char) < 32 for char in candidate)
+    ):
         return None
     return candidate
 
@@ -495,7 +532,9 @@ def browser_network_status() -> tuple[int, dict[str, object]]:
         return 503, payload
     sanitized = safe_network_payload(payload)
     NETWORK_SNAPSHOT = sanitized
-    return (200 if result.returncode == 0 and sanitized["status"] == "healthy" else 503), sanitized
+    return (
+        200 if result.returncode == 0 and sanitized["status"] == "healthy" else 503
+    ), sanitized
 
 
 def network_snapshot() -> dict[str, object]:
@@ -541,6 +580,10 @@ class Handler(BaseHTTPRequestHandler):
             status, payload = x_use_status()
             self.respond(status, payload)
             return
+        if parsed.path == "/x-use/check":
+            status, payload = x_use_check()
+            self.respond(status, payload)
+            return
         if parsed.path == "/x-use/drafts":
             query = parse_qs(parsed.query)
             raw_status = query.get("status", ["pending"])[0]
@@ -562,7 +605,9 @@ class Handler(BaseHTTPRequestHandler):
         if urlsplit(self.path).path != "/x-use/session":
             self.respond(404, {"status": "not_found"})
             return
-        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        content_type = (
+            self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        )
         if content_type != "application/json":
             self.respond(415, {"status": "error", "error": "application/json required"})
             return
@@ -574,7 +619,9 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(422, {"status": "error", "error": "Invalid X cookie export"})
             return
         if content_length > MAX_SESSION_BYTES:
-            self.respond(413, {"status": "error", "error": "X cookie export is too large"})
+            self.respond(
+                413, {"status": "error", "error": "X cookie export is too large"}
+            )
             return
         raw = self.rfile.read(content_length)
         try:
@@ -597,29 +644,40 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(status, payload)
             return
         if parts == ["x-use", "actions", "confirm"]:
-            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            content_type = (
+                self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            )
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 length = 0
             if content_type != "application/json" or length <= 0 or length > 8192:
-                self.respond(422, {"status": "failed", "diagnostic_code": "invalid_receipt"})
+                self.respond(
+                    422, {"status": "failed", "diagnostic_code": "invalid_receipt"}
+                )
                 return
             try:
                 payload = json.loads(self.rfile.read(length))
             except (UnicodeDecodeError, ValueError):
-                self.respond(422, {"status": "failed", "diagnostic_code": "invalid_receipt"})
+                self.respond(
+                    422, {"status": "failed", "diagnostic_code": "invalid_receipt"}
+                )
                 return
             if not isinstance(payload, dict):
-                self.respond(422, {"status": "failed", "diagnostic_code": "invalid_receipt"})
+                self.respond(
+                    422, {"status": "failed", "diagnostic_code": "invalid_receipt"}
+                )
                 return
             try:
                 from hermes_x_use_adapter import confirm_dashboard_action
-                result = asyncio.run(confirm_dashboard_action(
-                    action=payload.get("action"),
-                    target_tweet_url=payload.get("target_tweet_url"),
-                    reply_text=payload.get("reply_text"),
-                ))
+
+                result = asyncio.run(
+                    confirm_dashboard_action(
+                        action=payload.get("action"),
+                        target_tweet_url=payload.get("target_tweet_url"),
+                        reply_text=payload.get("reply_text"),
+                    )
+                )
             except Exception:
                 result = {"status": "pending", "diagnostic_code": "browser_unavailable"}
             self.respond(200, result)

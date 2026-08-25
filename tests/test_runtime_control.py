@@ -151,7 +151,9 @@ def test_x_use_preflight_marker_rejects_group_readable_or_symlink(
     assert control.x_use_preflight_ready() is False
 
 
-def test_network_payload_only_accepts_a_global_ip_and_the_selected_mode(control) -> None:
+def test_network_payload_only_accepts_a_global_ip_and_the_selected_mode(
+    control,
+) -> None:
     result = control.safe_network_payload(
         {
             "status": "ok",
@@ -170,9 +172,7 @@ def test_network_payload_only_accepts_a_global_ip_and_the_selected_mode(control)
 
 
 def test_network_payload_fails_closed_for_private_or_invalid_egress(control) -> None:
-    result = control.safe_network_payload(
-        {"status": "ok", "exit_ip": "127.0.0.1"}
-    )
+    result = control.safe_network_payload({"status": "ok", "exit_ip": "127.0.0.1"})
 
     assert result == {
         "status": "unhealthy",
@@ -250,7 +250,40 @@ def test_x_use_status_returns_200_for_every_valid_state_snapshot(
     assert payload["status"] == state
 
 
-def test_dashboard_draft_payload_exposes_content_but_not_local_media_paths(control) -> None:
+def test_x_use_check_refreshes_stale_snapshot_with_live_session(
+    control, monkeypatch
+) -> None:
+    control.write_x_use_snapshot(
+        {
+            "status": "not_configured",
+            "configured": False,
+            "session_present": False,
+            "account_verified": False,
+        }
+    )
+    monkeypatch.setattr(
+        control,
+        "live_status",
+        lambda: {
+            "status": "ready",
+            "configured": True,
+            "session_present": True,
+            "account_verified": True,
+            "expected_handle": "expected_user",
+            "authenticated_handle": "expected_user",
+        },
+    )
+
+    http_status, payload = control.x_use_check()
+
+    assert http_status == 200
+    assert payload["status"] == "ready"
+    assert control.read_x_use_snapshot()["status"] == "ready"
+
+
+def test_dashboard_draft_payload_exposes_content_but_not_local_media_paths(
+    control,
+) -> None:
     payload = control.safe_drafts_payload(
         {
             "drafts": [
@@ -274,7 +307,9 @@ def test_dashboard_draft_payload_exposes_content_but_not_local_media_paths(contr
     assert "/secret/operator" not in json.dumps(payload)
 
 
-def test_dashboard_drafts_drop_noncanonical_or_credential_marked_payloads(control) -> None:
+def test_dashboard_drafts_drop_noncanonical_or_credential_marked_payloads(
+    control,
+) -> None:
     payload = control.safe_drafts_payload(
         {
             "drafts": [
@@ -310,7 +345,9 @@ def test_dashboard_drafts_drop_noncanonical_or_credential_marked_payloads(contro
     assert payload == {"drafts": [], "count": 0}
 
 
-def test_dashboard_reply_payload_is_canonical_and_action_result_is_allowlisted(control) -> None:
+def test_dashboard_reply_payload_is_canonical_and_action_result_is_allowlisted(
+    control,
+) -> None:
     drafts = control.safe_drafts_payload(
         {
             "drafts": [
