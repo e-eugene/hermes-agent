@@ -1073,7 +1073,19 @@ def _like_tweet_outcome(
         button = WebDriverWait(article, 10).until(
             EC.element_to_be_clickable((By.XPATH, './/button[@data-testid="like"]'))
         )
-        button.click()
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", button
+            )
+        except Exception:
+            pass
+        try:
+            button.click()
+        except ElementClickInterceptedException:
+            # X sometimes keeps a transient engagement sheet above the action
+            # row. The button has already passed Selenium's visibility checks;
+            # use the same bounded DOM-click fallback as the reply composer.
+            driver.execute_script("arguments[0].click();", button)
         try:
             WebDriverWait(article, 5).until(
                 EC.presence_of_element_located(

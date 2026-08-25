@@ -823,6 +823,62 @@ def test_like_waits_for_exact_status_article_after_x_navigation(
     assert calls == [(15, 0.25)]
 
 
+def test_like_uses_dom_click_when_transient_overlay_intercepts_button(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Browser:
+        def navigate_to(self, _url: str) -> bool:
+            return True
+
+        def get_driver(self):
+            return driver
+
+    class Article:
+        def find_elements(self, _by, xpath):
+            if "unlike" in xpath:
+                return []
+            return []
+
+    class Button:
+        def click(self):
+            raise adapter.ElementClickInterceptedException("overlay")
+
+    class Driver:
+        def __init__(self):
+            self.scripts: list[str] = []
+
+        def execute_script(self, script, _button):
+            self.scripts.append(script)
+
+    class Wait:
+        def __init__(self, _driver, _timeout, poll_frequency=None):
+            self.target = _driver
+
+        def until(self, predicate):
+            if self.target is driver:
+                return article
+            if self.target is article:
+                return button
+            return predicate(self.target)
+
+    article = Article()
+    button = Button()
+    driver = Driver()
+    monkeypatch.setattr(adapter, "WebDriverWait", Wait)
+    monkeypatch.setattr(adapter, "find_article_with_status_id", lambda *_args: article)
+
+    assert (
+        adapter._like_tweet_outcome(
+            Browser(), tweet_id="123", tweet_url="https://x.com/i/web/status/123"
+        )
+        == "clicked_confirmed"
+    )
+    assert driver.scripts == [
+        "arguments[0].scrollIntoView({block: 'center'});",
+        "arguments[0].click();",
+    ]
+
+
 def test_mcp_draft_readers_revalidate_persistent_records_and_preview(adapter) -> None:
     server = adapter.create_safe_server()
     store = server.xuse_ctx.draft_store
