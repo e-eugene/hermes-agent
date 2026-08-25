@@ -128,10 +128,13 @@ MAX_RETAINED_TERMINAL_DRAFTS = 300
 MAX_SEARCH_QUERY_CHARS = 256
 MAX_SINGLE_TWEET_CANDIDATES = 20
 MAX_METRICS_FILE_BYTES = 256 * 1024
-# X can lag a few seconds before a newly published reply appears on the
-# account's Replies timeline.  This is still bounded so an unavailable page
-# cannot hold an agent indefinitely.
-MAX_REPLY_CONFIRMATION_ATTEMPTS = 10
+# Confirmation is a single read-only observation. The dashboard owns retries
+# through its durable WorkItem queue, so the runtime must not turn one request
+# into a long series of browser scans or navigate an old compatibility view.
+# One source-thread navigation is capped well below the dashboard's 90-second
+# control-request timeout.
+DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = 45
+REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS = 30
 REPLY_DISCLOSURE_SETTLE_SECONDS = 0.5
 CDP_DEBUGGER_ADDRESS = "127.0.0.1:9222"
 CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
@@ -343,7 +346,7 @@ class SafeAttachedBrowserManager:
         self.driver = driver
         self._service = service
         try:
-            driver.set_page_load_timeout(45)
+            driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
             driver.set_script_timeout(30)
             self._owned_handle = self._create_owned_target()
             self._switch_to_owned()
@@ -1145,6 +1148,49 @@ def _reveal_hidden_reply_section(driver: Any) -> bool:
     return False
 
 
+def _navigate_for_reply_confirmation(
+    browser_manager: Any,
+    driver: Any,
+    url: str,
+    *,
+    page_load_timeout: float,
+) -> bool:
+    """Make one bounded read-only navigation for a receipt observation.
+
+    ``SafeAttachedBrowserManager.navigate_to`` retries normal pre-write
+    navigations because a browser target may be recreated before a mutation.
+    Receipt confirmation must be cheaper and bounded: the accepted receipt is
+    durable and the dashboard will schedule the next read-only observation.
+    Passing ``ensure_driver=False`` therefore deliberately gives this lookup a
+    single navigation attempt on the session that was verified immediately
+    before it entered the confirmation path.
+    """
+
+    set_page_load_timeout = getattr(driver, "set_page_load_timeout", None)
+    if callable(set_page_load_timeout):
+        try:
+            set_page_load_timeout(page_load_timeout)
+        except Exception:
+            # Without the cap an unavailable renderer could keep the private
+            # HTTP request open beyond the dashboard's bounded retry window.
+            return False
+    try:
+        return bool(browser_manager.navigate_to(url, ensure_driver=False))
+    except Exception:
+        return False
+
+
+def _restore_default_page_load_timeout(driver: Any) -> None:
+    """Restore the normal action-navigation timeout after a confirmation scan."""
+
+    set_page_load_timeout = getattr(driver, "set_page_load_timeout", None)
+    if callable(set_page_load_timeout):
+        try:
+            set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+
+
 def _confirmed_direct_reply_url(
     browser_manager: Any,
     account_id: str,
@@ -1159,8 +1205,9 @@ def _confirmed_direct_reply_url(
     its probable-spam disclosure. We inspect normal replies first, reveal only
     the semantic disclosure control, then re-scan. When that re-scan is the
     proof, ``confirmation_evidence`` records it for the dashboard response.
-    The older profile timeline is retained only as a compatibility fallback for
-    ordinary replies that X has not ranked into the source thread yet.
+    This is exactly one source scan. The durable dashboard WorkItem owns every
+    later retry; confirmation deliberately never navigates the old profile
+    timeline or retries inside this HTTP request.
     """
 
     source_url = target_tweet_url or f"https://x.com/i/web/status/{target_tweet_id}"
@@ -1168,50 +1215,56 @@ def _confirmed_direct_reply_url(
         source_url = canonical_x_status_url(source_url)[0]
     except ValueError:
         source_url = f"https://x.com/i/web/status/{target_tweet_id}"
-    profile_url = f"https://x.com/{account_id}/with_replies"
-    for attempt in range(MAX_REPLY_CONFIRMATION_ATTEMPTS):
-        try:
-            if browser_manager.navigate_to(source_url):
-                driver = browser_manager.get_driver()
-                confirmed = _reply_permalink_from_view(
-                    driver,
-                    account_id=account_id,
-                    target_tweet_id=target_tweet_id,
-                    reply_text=reply_text,
-                )
-                if confirmed:
-                    return confirmed
-                if _reveal_hidden_reply_section(driver):
-                    time.sleep(REPLY_DISCLOSURE_SETTLE_SECONDS)
-                    confirmed = _reply_permalink_from_view(
-                        driver,
-                        account_id=account_id,
-                        target_tweet_id=target_tweet_id,
-                        reply_text=reply_text,
+    driver: Any | None = None
+    try:
+        # The surrounding verified session already proved the expected account,
+        # so this reads the same owned target without another identity/home
+        # navigation.
+        driver = browser_manager.get_driver()
+        if not _navigate_for_reply_confirmation(
+            browser_manager,
+            driver,
+            source_url,
+            page_load_timeout=REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS,
+        ):
+            return None
+
+        # First proof path: ordinary source-thread replies.
+        confirmed = _reply_permalink_from_view(
+            driver,
+            account_id=account_id,
+            target_tweet_id=target_tweet_id,
+            reply_text=reply_text,
+        )
+        if confirmed:
+            return confirmed
+
+        # Second proof path: the only permitted non-writing interaction is the
+        # strict semantic X control for replies hidden as probable spam.
+        if _reveal_hidden_reply_section(driver):
+            time.sleep(REPLY_DISCLOSURE_SETTLE_SECONDS)
+            confirmed = _reply_permalink_from_view(
+                driver,
+                account_id=account_id,
+                target_tweet_id=target_tweet_id,
+                reply_text=reply_text,
+            )
+            if confirmed:
+                if confirmation_evidence is not None:
+                    confirmation_evidence.update(
+                        {
+                            "proof_source": "source_thread_hidden_spam",
+                            "hidden_spam_disclosed": True,
+                        }
                     )
-                    if confirmed:
-                        if confirmation_evidence is not None:
-                            confirmation_evidence.update(
-                                {
-                                    "proof_source": "source_thread_hidden_spam",
-                                    "hidden_spam_disclosed": True,
-                                }
-                            )
-                        return confirmed
-            if browser_manager.navigate_to(profile_url):
-                confirmed = _reply_permalink_from_view(
-                    browser_manager.get_driver(),
-                    account_id=account_id,
-                    target_tweet_id=target_tweet_id,
-                    reply_text=reply_text,
-                )
-                if confirmed:
-                    return confirmed
-        except Exception:
-            pass
-        if attempt + 1 < MAX_REPLY_CONFIRMATION_ATTEMPTS:
-            time.sleep(1.0)
-    return None
+                return confirmed
+
+        return None
+    except Exception:
+        return None
+    finally:
+        if driver is not None:
+            _restore_default_page_load_timeout(driver)
 
 
 def _confirmed_like_url(browser_manager: Any, target_url: str) -> str | None:

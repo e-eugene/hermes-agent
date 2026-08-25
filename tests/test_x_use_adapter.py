@@ -681,6 +681,7 @@ def reply_confirmation_browser(
         def __init__(self):
             self.reply_visible = reply_visible
             self.disclosure = Disclosure(self) if disclosure_label else None
+            self.page_load_timeouts: list[float] = []
 
         def find_elements(self, _by: str, selector: str):
             if selector == adapter.TWEET_ARTICLE_XPATH:
@@ -689,12 +690,16 @@ def reply_confirmation_browser(
                 return [self.disclosure] if self.disclosure else []
             return []
 
+        def set_page_load_timeout(self, value: float):
+            self.page_load_timeouts.append(value)
+
     class Manager:
         def __init__(self, driver):
             self.driver = driver
             self.navigations: list[str] = []
 
-        def navigate_to(self, url: str):
+        def navigate_to(self, url: str, ensure_driver: bool = True):
+            assert ensure_driver is False
             self.navigations.append(url)
             return True
 
@@ -721,6 +726,10 @@ def test_reply_confirmation_checks_source_thread_with_absolute_status_href(adapt
     assert result == "https://x.com/expected_user/status/456"
     assert manager.navigations == ["https://x.com/source_user/status/123"]
     assert driver.disclosure is None
+    assert driver.page_load_timeouts == [
+        adapter.REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
+    ]
     assert evidence == {}
 
 
@@ -752,6 +761,10 @@ def test_reply_confirmation_reveals_localized_hidden_spam_reply(
     assert driver.disclosure is not None
     assert driver.disclosure.clicks == 1
     assert manager.navigations == ["https://x.com/source_user/status/123"]
+    assert driver.page_load_timeouts == [
+        adapter.REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
+    ]
     assert evidence == {
         "proof_source": "source_thread_hidden_spam",
         "hidden_spam_disclosed": True,
@@ -759,15 +772,13 @@ def test_reply_confirmation_reveals_localized_hidden_spam_reply(
 
 
 def test_reply_confirmation_does_not_click_an_unrecognized_disclosure_control(
-    adapter, monkeypatch: pytest.MonkeyPatch
+    adapter,
 ) -> None:
     manager, driver = reply_confirmation_browser(
         adapter,
         reply_visible=False,
         disclosure_label="Show more replies",
     )
-    monkeypatch.setattr(adapter, "MAX_REPLY_CONFIRMATION_ATTEMPTS", 1)
-
     result = adapter._confirmed_direct_reply_url(
         manager,
         "expected_user",
@@ -779,6 +790,13 @@ def test_reply_confirmation_does_not_click_an_unrecognized_disclosure_control(
     assert result is None
     assert driver.disclosure is not None
     assert driver.disclosure.clicks == 0
+    assert manager.navigations == [
+        "https://x.com/source_user/status/123",
+    ]
+    assert driver.page_load_timeouts == [
+        adapter.REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
+    ]
 
 
 def test_reply_disclosure_filter_rejects_generic_or_writing_controls(adapter) -> None:
@@ -810,15 +828,13 @@ def test_reply_disclosure_filter_rejects_generic_or_writing_controls(adapter) ->
 
 
 def test_reply_confirmation_rejects_identical_text_from_another_account(
-    adapter, monkeypatch: pytest.MonkeyPatch
+    adapter,
 ) -> None:
     manager, _driver = reply_confirmation_browser(
         adapter,
         reply_visible=True,
         reply_href="/another_user/status/456",
     )
-    monkeypatch.setattr(adapter, "MAX_REPLY_CONFIRMATION_ATTEMPTS", 1)
-
     result = adapter._confirmed_direct_reply_url(
         manager,
         "expected_user",
@@ -830,7 +846,10 @@ def test_reply_confirmation_rejects_identical_text_from_another_account(
     assert result is None
     assert manager.navigations == [
         "https://x.com/source_user/status/123",
-        "https://x.com/expected_user/with_replies",
+    ]
+    assert manager.driver.page_load_timeouts == [
+        adapter.REPLY_CONFIRMATION_SOURCE_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
     ]
 
 
