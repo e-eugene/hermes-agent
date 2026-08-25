@@ -138,6 +138,8 @@ DEFAULT_IDENTITY_TIMEOUT_SECONDS = 35
 CONFIRMATION_PROCESS_LOCK_TIMEOUT_SECONDS = 5
 CONFIRMATION_IDENTITY_TIMEOUT_SECONDS = 30
 CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS = 30
+CONFIRMATION_REPLY_DISCOVERY_TIMEOUT_SECONDS = 5
+CONFIRMATION_REPLY_DISCOVERY_POLL_SECONDS = 0.25
 REPLY_DISCLOSURE_SETTLE_SECONDS = 0.5
 CDP_DEBUGGER_ADDRESS = "127.0.0.1:9222"
 CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
@@ -1228,22 +1230,62 @@ def _is_reply_disclosure_control(control: Any) -> bool:
     )
 
 
-def _reveal_hidden_reply_section(driver: Any) -> bool:
-    """Click at most one verified reply disclosure and never an X write control."""
+def _find_reply_disclosure_control(driver: Any) -> Any | None:
+    """Find one strict probable-spam disclosure without interacting with X."""
 
     try:
         controls = driver.find_elements("xpath", REPLY_DISCLOSURE_CONTROL_XPATH)
     except Exception:
-        return False
+        return None
     for control in controls:
-        if not _is_reply_disclosure_control(control):
-            continue
-        try:
-            control.click()
-        except Exception:
-            continue
-        return True
-    return False
+        if _is_reply_disclosure_control(control):
+            return control
+    return None
+
+
+def _reveal_hidden_reply_section(control: Any) -> bool:
+    """Click one verified reply disclosure and never an X write control."""
+
+    if not _is_reply_disclosure_control(control):
+        return False
+    try:
+        control.click()
+    except Exception:
+        return False
+    return True
+
+
+def _wait_for_reply_proof_or_disclosure(
+    driver: Any,
+    *,
+    account_id: str,
+    target_tweet_id: str,
+    reply_text: str,
+) -> tuple[str | None, Any | None]:
+    """Wait briefly for either public proof or X's strict hidden-reply control.
+
+    X commonly commits the source document before it renders reply articles or
+    the probable-spam disclosure. This is a bounded, read-only DOM poll: it
+    never navigates again and never clicks until a strict control is visible.
+    """
+
+    deadline = time.monotonic() + CONFIRMATION_REPLY_DISCOVERY_TIMEOUT_SECONDS
+    while True:
+        confirmed = _reply_permalink_from_view(
+            driver,
+            account_id=account_id,
+            target_tweet_id=target_tweet_id,
+            reply_text=reply_text,
+        )
+        if confirmed:
+            return confirmed, None
+        disclosure = _find_reply_disclosure_control(driver)
+        if disclosure is not None:
+            return None, disclosure
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, None
+        time.sleep(min(CONFIRMATION_REPLY_DISCOVERY_POLL_SECONDS, remaining))
 
 
 def _navigate_for_confirmation(
@@ -1303,9 +1345,9 @@ def _confirmed_direct_reply_url(
     its probable-spam disclosure. We inspect normal replies first, reveal only
     the semantic disclosure control, then re-scan. When that re-scan is the
     proof, ``confirmation_evidence`` records it for the dashboard response.
-    This is exactly one source scan. The durable dashboard WorkItem owns every
-    later retry; confirmation deliberately never navigates the old profile
-    timeline or retries inside this HTTP request.
+    This is exactly one source-thread navigation with a short DOM-render poll.
+    The durable dashboard WorkItem owns every later retry; confirmation never
+    navigates the old profile timeline or retries inside this HTTP request.
     """
 
     source_url = target_tweet_url or f"https://x.com/i/web/status/{target_tweet_id}"
@@ -1330,8 +1372,9 @@ def _confirmed_direct_reply_url(
         ):
             return None
 
-        # First proof path: ordinary source-thread replies.
-        confirmed = _reply_permalink_from_view(
+        # Wait for X to render either an ordinary source-thread reply or the
+        # strict semantic control that hides it as probable spam.
+        confirmed, disclosure = _wait_for_reply_proof_or_disclosure(
             driver,
             account_id=account_id,
             target_tweet_id=target_tweet_id,
@@ -1342,7 +1385,7 @@ def _confirmed_direct_reply_url(
 
         # Second proof path: the only permitted non-writing interaction is the
         # strict semantic X control for replies hidden as probable spam.
-        if _reveal_hidden_reply_section(driver):
+        if disclosure is not None and _reveal_hidden_reply_section(disclosure):
             time.sleep(REPLY_DISCLOSURE_SETTLE_SECONDS)
             confirmed = _reply_permalink_from_view(
                 driver,

@@ -637,6 +637,8 @@ def reply_confirmation_browser(
     reply_visible: bool,
     reply_href: str = "https://x.com/expected_user/status/456",
     disclosure_label: str | None = None,
+    reply_delay_polls: int = 0,
+    disclosure_delay_polls: int = 0,
 ):
     """Build a minimal source-thread DOM for read-only receipt proofs."""
 
@@ -682,12 +684,25 @@ def reply_confirmation_browser(
             self.reply_visible = reply_visible
             self.disclosure = Disclosure(self) if disclosure_label else None
             self.page_load_timeouts: list[float] = []
+            self.reply_polls = 0
+            self.disclosure_polls = 0
 
         def find_elements(self, _by: str, selector: str):
             if selector == adapter.TWEET_ARTICLE_XPATH:
-                return [Article()] if self.reply_visible else []
+                self.reply_polls += 1
+                return (
+                    [Article()]
+                    if self.reply_visible and self.reply_polls > reply_delay_polls
+                    else []
+                )
             if selector == adapter.REPLY_DISCLOSURE_CONTROL_XPATH:
-                return [self.disclosure] if self.disclosure else []
+                self.disclosure_polls += 1
+                return (
+                    [self.disclosure]
+                    if self.disclosure
+                    and self.disclosure_polls > disclosure_delay_polls
+                    else []
+                )
             return []
 
         def set_page_load_timeout(self, value: float):
@@ -708,6 +723,25 @@ def reply_confirmation_browser(
 
     driver = Driver()
     return Manager(driver), driver
+
+
+def install_confirmation_clock(adapter, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Advance the bounded DOM-poll clock without making tests wait five seconds."""
+
+    now = 0.0
+    sleeps: list[float] = []
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    monkeypatch.setattr(adapter.time, "monotonic", monotonic)
+    monkeypatch.setattr(adapter.time, "sleep", sleep)
+    return sleeps
 
 
 def test_reply_confirmation_checks_source_thread_with_absolute_status_href(adapter) -> None:
@@ -771,14 +805,56 @@ def test_reply_confirmation_reveals_localized_hidden_spam_reply(
     }
 
 
+@pytest.mark.parametrize("kind", ["reply", "hidden_spam"])
+def test_reply_confirmation_waits_for_delayed_source_dom(
+    adapter, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    manager, driver = reply_confirmation_browser(
+        adapter,
+        reply_visible=kind == "reply",
+        disclosure_label="Show probable spam" if kind == "hidden_spam" else None,
+        reply_delay_polls=2 if kind == "reply" else 0,
+        disclosure_delay_polls=2 if kind == "hidden_spam" else 0,
+    )
+    sleeps = install_confirmation_clock(adapter, monkeypatch)
+    evidence: dict[str, object] = {}
+
+    result = adapter._confirmed_direct_reply_url(
+        manager,
+        "expected_user",
+        "123",
+        "Exact accepted reply",
+        "https://x.com/source_user/status/123",
+        evidence,
+    )
+
+    assert result == "https://x.com/expected_user/status/456"
+    assert sleeps[:2] == [
+        adapter.CONFIRMATION_REPLY_DISCOVERY_POLL_SECONDS,
+        adapter.CONFIRMATION_REPLY_DISCOVERY_POLL_SECONDS,
+    ]
+    if kind == "reply":
+        assert driver.disclosure_polls == 2
+        assert evidence == {}
+    else:
+        assert driver.disclosure is not None
+        assert driver.disclosure.clicks == 1
+        assert evidence == {
+            "proof_source": "source_thread_hidden_spam",
+            "hidden_spam_disclosed": True,
+        }
+
+
 def test_reply_confirmation_does_not_click_an_unrecognized_disclosure_control(
     adapter,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, driver = reply_confirmation_browser(
         adapter,
         reply_visible=False,
         disclosure_label="Show more replies",
     )
+    sleeps = install_confirmation_clock(adapter, monkeypatch)
     result = adapter._confirmed_direct_reply_url(
         manager,
         "expected_user",
@@ -797,6 +873,9 @@ def test_reply_confirmation_does_not_click_an_unrecognized_disclosure_control(
         adapter.CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
         adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
     ]
+    assert sum(sleeps) == pytest.approx(
+        adapter.CONFIRMATION_REPLY_DISCOVERY_TIMEOUT_SECONDS
+    )
 
 
 def test_reply_disclosure_filter_rejects_generic_or_writing_controls(adapter) -> None:
@@ -832,12 +911,14 @@ def test_reply_disclosure_filter_rejects_generic_or_writing_controls(adapter) ->
 
 def test_reply_confirmation_rejects_identical_text_from_another_account(
     adapter,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager, _driver = reply_confirmation_browser(
         adapter,
         reply_visible=True,
         reply_href="/another_user/status/456",
     )
+    install_confirmation_clock(adapter, monkeypatch)
     result = adapter._confirmed_direct_reply_url(
         manager,
         "expected_user",
