@@ -1125,6 +1125,33 @@ def _normalized_visible_text(value: object) -> str:
     return " ".join(str(value or "").split())
 
 
+def _normalized_reply_keywords(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        normalized = _normalized_visible_text(item).casefold()
+        if normalized and len(normalized) <= 80 and normalized not in seen:
+            keywords.append(normalized)
+            seen.add(normalized)
+    return tuple(keywords[:5])
+
+
+def _reply_matches_confirmation_criteria(
+    visible_text: str,
+    *,
+    reply_text: str | None,
+    reply_keywords: tuple[str, ...],
+) -> bool:
+    if reply_text is not None:
+        return visible_text == _normalized_visible_text(reply_text)
+    haystack = visible_text.casefold()
+    return bool(haystack) and any(keyword in haystack for keyword in reply_keywords)
+
+
 def _canonical_status_href(href: object) -> tuple[str, str] | None:
     """Return one canonical X status link from Selenium's relative or absolute href."""
 
@@ -1142,12 +1169,15 @@ def _reply_permalink_from_view(
     *,
     account_id: str,
     target_tweet_id: str,
-    reply_text: str,
+    reply_text: str | None,
+    reply_keywords: tuple[str, ...] = (),
+    confirmation_evidence: dict[str, Any] | None = None,
 ) -> str | None:
-    """Find the exact assigned-account reply among rendered tweet articles."""
+    """Find the assigned-account reply among rendered tweet articles."""
 
-    expected = _normalized_visible_text(reply_text)
-    if not expected:
+    if reply_text is not None and not _normalized_visible_text(reply_text):
+        return None
+    if reply_text is None and not reply_keywords:
         return None
     try:
         articles = driver.find_elements("xpath", TWEET_ARTICLE_XPATH)
@@ -1162,7 +1192,11 @@ def _reply_permalink_from_view(
             visible_text = _normalized_visible_text(
                 "\n".join((node.text or "").strip() for node in text_nodes)
             )
-            if visible_text != expected:
+            if not _reply_matches_confirmation_criteria(
+                visible_text,
+                reply_text=reply_text,
+                reply_keywords=reply_keywords,
+            ):
                 continue
             # X renders the article's own status permalink on its timestamp.
             # Restricting to that anchor avoids treating a quoted/status link
@@ -1181,6 +1215,8 @@ def _reply_permalink_from_view(
                     status_id != target_tweet_id
                     and permalink.startswith(own_reply_prefix)
                 ):
+                    if confirmation_evidence is not None and reply_text is None:
+                        confirmation_evidence["matched_text"] = visible_text
                     return permalink
         except Exception:
             continue
@@ -1260,7 +1296,9 @@ def _wait_for_reply_proof_or_disclosure(
     *,
     account_id: str,
     target_tweet_id: str,
-    reply_text: str,
+    reply_text: str | None,
+    reply_keywords: tuple[str, ...] = (),
+    confirmation_evidence: dict[str, Any] | None = None,
 ) -> tuple[str | None, Any | None]:
     """Wait briefly for either public proof or X's strict hidden-reply control.
 
@@ -1276,6 +1314,8 @@ def _wait_for_reply_proof_or_disclosure(
             account_id=account_id,
             target_tweet_id=target_tweet_id,
             reply_text=reply_text,
+            reply_keywords=reply_keywords,
+            confirmation_evidence=confirmation_evidence,
         )
         if confirmed:
             return confirmed, None
@@ -1335,9 +1375,10 @@ def _confirmed_direct_reply_url(
     browser_manager: Any,
     account_id: str,
     target_tweet_id: str,
-    reply_text: str,
+    reply_text: str | None,
     target_tweet_url: str | None = None,
     confirmation_evidence: dict[str, Any] | None = None,
+    reply_keywords: tuple[str, ...] = (),
 ) -> str | None:
     """Find a public permalink for the accepted reply without another X write.
 
@@ -1379,6 +1420,8 @@ def _confirmed_direct_reply_url(
             account_id=account_id,
             target_tweet_id=target_tweet_id,
             reply_text=reply_text,
+            reply_keywords=reply_keywords,
+            confirmation_evidence=confirmation_evidence,
         )
         if confirmed:
             return confirmed
@@ -1392,6 +1435,8 @@ def _confirmed_direct_reply_url(
                 account_id=account_id,
                 target_tweet_id=target_tweet_id,
                 reply_text=reply_text,
+                reply_keywords=reply_keywords,
+                confirmation_evidence=confirmation_evidence,
             )
             if confirmed:
                 if confirmation_evidence is not None:
@@ -1528,7 +1573,11 @@ async def confirmed_direct_reply_url(
 
 
 async def confirm_dashboard_action(
-    *, action: str, target_tweet_url: str, reply_text: str | None = None
+    *,
+    action: str,
+    target_tweet_url: str,
+    reply_text: str | None = None,
+    reply_keywords: object = None,
 ) -> dict[str, Any]:
     """Read-only confirmation API used after an already accepted X action.
 
@@ -1542,8 +1591,11 @@ async def confirm_dashboard_action(
         return {"status": "failed", "diagnostic_code": "invalid_receipt"}
     if action not in {"like", "reply"}:
         return {"status": "failed", "diagnostic_code": "invalid_action"}
-    if action == "reply" and (not isinstance(reply_text, str) or not reply_text.strip()):
-        return {"status": "failed", "diagnostic_code": "invalid_receipt"}
+    normalized_keywords = _normalized_reply_keywords(reply_keywords)
+    if action == "reply":
+        has_exact_text = isinstance(reply_text, str) and bool(reply_text.strip())
+        if not has_exact_text and not normalized_keywords:
+            return {"status": "failed", "diagnostic_code": "invalid_receipt"}
     confirmation_evidence: dict[str, Any] = {}
     try:
         loader = runtime_config_loader()
@@ -1560,9 +1612,10 @@ async def confirm_dashboard_action(
                     browser_manager,
                     account_id,
                     target_id,
-                    reply_text.strip(),
+                    reply_text.strip() if isinstance(reply_text, str) else None,
                     target_url,
                     confirmation_evidence,
+                    normalized_keywords,
                 )
         raise_deferred_cancellation(cancellation)
     except (WrongAccountError, SessionNotVerifiedError):
@@ -1577,6 +1630,8 @@ async def confirm_dashboard_action(
         # byte-for-byte compatible with the existing contract.
         if confirmation_evidence.get("hidden_spam_disclosed") is True:
             response.update(confirmation_evidence)
+        elif "matched_text" in confirmation_evidence:
+            response["matched_text"] = confirmation_evidence["matched_text"]
         return response
     return {"status": "pending", "diagnostic_code": "not_visible_yet"}
 

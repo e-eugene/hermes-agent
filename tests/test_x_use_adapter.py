@@ -635,6 +635,7 @@ def reply_confirmation_browser(
     adapter,
     *,
     reply_visible: bool,
+    reply_text: str = "Exact accepted reply",
     reply_href: str = "https://x.com/expected_user/status/456",
     disclosure_label: str | None = None,
     reply_delay_polls: int = 0,
@@ -643,7 +644,7 @@ def reply_confirmation_browser(
     """Build a minimal source-thread DOM for read-only receipt proofs."""
 
     class TextNode:
-        text = "Exact accepted reply"
+        text = reply_text
 
     class Anchor:
         def get_attribute(self, name: str):
@@ -800,6 +801,62 @@ def test_reply_confirmation_reveals_localized_hidden_spam_reply(
         adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
     ]
     assert evidence == {
+        "proof_source": "source_thread_hidden_spam",
+        "hidden_spam_disclosed": True,
+    }
+
+
+def test_reply_confirmation_accepts_assigned_account_keyword_match(adapter) -> None:
+    manager, _driver = reply_confirmation_browser(
+        adapter,
+        reply_visible=True,
+        reply_text="PersProtect.com can help reduce exposed personal data.",
+    )
+    evidence: dict[str, object] = {}
+
+    result = adapter._confirmed_direct_reply_url(
+        manager,
+        "expected_user",
+        "123",
+        None,
+        "https://x.com/source_user/status/123",
+        evidence,
+        ("persprotect.com", "persprotect"),
+    )
+
+    assert result == "https://x.com/expected_user/status/456"
+    assert evidence == {
+        "matched_text": "PersProtect.com can help reduce exposed personal data."
+    }
+
+
+def test_reply_confirmation_accepts_hidden_spam_keyword_match(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, driver = reply_confirmation_browser(
+        adapter,
+        reply_visible=False,
+        reply_text="PersProtect helps reduce exposed personal data.",
+        disclosure_label="Show probable spam",
+    )
+    monkeypatch.setattr(adapter.time, "sleep", lambda _seconds: None)
+    evidence: dict[str, object] = {}
+
+    result = adapter._confirmed_direct_reply_url(
+        manager,
+        "expected_user",
+        "123",
+        None,
+        "https://x.com/source_user/status/123",
+        evidence,
+        ("persprotect.com", "persprotect"),
+    )
+
+    assert result == "https://x.com/expected_user/status/456"
+    assert driver.disclosure is not None
+    assert driver.disclosure.clicks == 1
+    assert evidence == {
+        "matched_text": "PersProtect helps reduce exposed personal data.",
         "proof_source": "source_thread_hidden_spam",
         "hidden_spam_disclosed": True,
     }
@@ -1021,7 +1078,9 @@ def test_like_confirmation_waits_for_delayed_target_toolbar(
 def test_dashboard_reply_confirmation_only_uses_the_read_only_proof_path(
     adapter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple[object, str, str, str, str | None, dict[str, object]]] = []
+    calls: list[
+        tuple[object, str, str, str | None, str | None, dict[str, object], tuple[str, ...]]
+    ] = []
 
     class Pool:
         @asynccontextmanager
@@ -1033,9 +1092,10 @@ def test_dashboard_reply_confirmation_only_uses_the_read_only_proof_path(
         browser_manager,
         account_id: str,
         target_tweet_id: str,
-        reply_text: str,
+        reply_text: str | None,
         target_tweet_url: str | None,
         confirmation_evidence: dict[str, object],
+        reply_keywords: tuple[str, ...],
     ):
         calls.append(
             (
@@ -1045,6 +1105,7 @@ def test_dashboard_reply_confirmation_only_uses_the_read_only_proof_path(
                 reply_text,
                 target_tweet_url,
                 confirmation_evidence,
+                reply_keywords,
             )
         )
         return "https://x.com/expected_user/status/456"
@@ -1078,8 +1139,55 @@ def test_dashboard_reply_confirmation_only_uses_the_read_only_proof_path(
             "Exact accepted reply",
             "https://x.com/source_user/status/123",
             {},
+            (),
         )
     ]
+
+
+def test_dashboard_reply_confirmation_accepts_keyword_criteria(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str | None, tuple[str, ...]]] = []
+
+    class Pool:
+        @asynccontextmanager
+        async def confirmation_session(self, account: str):
+            assert account == "expected_user"
+            yield "verified-browser"
+
+    def fake_proof(
+        _browser_manager,
+        _account_id: str,
+        _target_tweet_id: str,
+        reply_text: str | None,
+        _target_tweet_url: str | None,
+        confirmation_evidence: dict[str, object],
+        reply_keywords: tuple[str, ...],
+    ):
+        calls.append((reply_text, reply_keywords))
+        confirmation_evidence["matched_text"] = (
+            "PersProtect.com helps reduce exposed personal data."
+        )
+        return "https://x.com/expected_user/status/456"
+
+    monkeypatch.setattr(adapter, "runtime_config_loader", lambda: object())
+    monkeypatch.setattr(adapter, "session_pool", lambda _loader: Pool())
+    monkeypatch.setattr(adapter, "_confirmed_direct_reply_url", fake_proof)
+
+    result = asyncio.run(
+        adapter.confirm_dashboard_action(
+            action="reply",
+            target_tweet_url="https://x.com/source_user/status/123",
+            reply_keywords=["PersProtect.com", "persprotect"],
+        )
+    )
+
+    assert result == {
+        "status": "confirmed",
+        "permalink": "https://x.com/expected_user/status/456",
+        "matched_text": "PersProtect.com helps reduce exposed personal data.",
+    }
+    assert calls == [(None, ("persprotect.com", "persprotect"))]
 
 
 def test_dashboard_reply_confirmation_reports_hidden_spam_proof(

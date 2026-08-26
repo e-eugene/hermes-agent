@@ -677,6 +677,7 @@ class Handler(BaseHTTPRequestHandler):
                         action=payload.get("action"),
                         target_tweet_url=payload.get("target_tweet_url"),
                         reply_text=payload.get("reply_text"),
+                        reply_keywords=payload.get("reply_keywords"),
                     )
                 )
             except Exception:
