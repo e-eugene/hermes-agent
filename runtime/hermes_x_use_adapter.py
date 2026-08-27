@@ -131,13 +131,14 @@ MAX_METRICS_FILE_BYTES = 256 * 1024
 # Confirmation is a single read-only observation. The dashboard owns retries
 # through its durable WorkItem queue, so the runtime must not turn one request
 # into a long series of browser scans or navigate an old compatibility view.
-# One source-thread navigation is capped well below the dashboard's 90-second
-# control-request timeout.
+# The source-thread and author-profile navigations are capped below the
+# dashboard's 90-second control-request timeout.
 DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = 45
 DEFAULT_IDENTITY_TIMEOUT_SECONDS = 35
 CONFIRMATION_PROCESS_LOCK_TIMEOUT_SECONDS = 5
 CONFIRMATION_IDENTITY_TIMEOUT_SECONDS = 30
 CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS = 30
+CONFIRMATION_PROFILE_PAGE_LOAD_TIMEOUT_SECONDS = 20
 CONFIRMATION_REPLY_DISCOVERY_TIMEOUT_SECONDS = 5
 CONFIRMATION_REPLY_DISCOVERY_POLL_SECONDS = 0.25
 REPLY_DISCLOSURE_SETTLE_SECONDS = 0.5
@@ -152,6 +153,7 @@ CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
 SELENIUM_IDENTITY_SCRIPT = f"return ({IDENTITY_EXPRESSION.strip()});"
 logger = logging.getLogger(__name__)
 TWEET_ARTICLE_XPATH = "//article[@data-testid='tweet']"
+STATUS_LINK_XPATH = ".//a[@href and contains(@href, '/status/')]"
 # X puts the ``Show probable spam`` control outside a tweet article in the
 # conversation column. Keep the query structural so localized labels are
 # discovered through their semantic button role rather than an English text
@@ -1223,6 +1225,140 @@ def _reply_permalink_from_view(
     return None
 
 
+def _view_contains_status_id(driver: Any, target_tweet_id: str) -> bool:
+    """Return true when the rendered conversation links to a target status."""
+
+    try:
+        articles = driver.find_elements("xpath", TWEET_ARTICLE_XPATH)
+    except Exception:
+        return False
+    for article in articles[:30]:
+        try:
+            anchors = article.find_elements("xpath", STATUS_LINK_XPATH)
+            if not anchors:
+                anchors = article.find_elements("xpath", ".//a[@href and .//time]")
+            for anchor in anchors[:50]:
+                candidate = _canonical_status_href(anchor.get_attribute("href"))
+                if candidate is not None and candidate[1] == target_tweet_id:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_for_reply_proof(
+    driver: Any,
+    *,
+    account_id: str,
+    target_tweet_id: str,
+    reply_text: str | None,
+    reply_keywords: tuple[str, ...] = (),
+    confirmation_evidence: dict[str, Any] | None = None,
+    required_visible_status_id: str | None = None,
+) -> str | None:
+    """Wait briefly for a matching assigned-account reply in the current view."""
+
+    deadline = time.monotonic() + CONFIRMATION_REPLY_DISCOVERY_TIMEOUT_SECONDS
+    while True:
+        confirmed = _reply_permalink_from_view(
+            driver,
+            account_id=account_id,
+            target_tweet_id=target_tweet_id,
+            reply_text=reply_text,
+            reply_keywords=reply_keywords,
+            confirmation_evidence=confirmation_evidence,
+        )
+        if confirmed and (
+            required_visible_status_id is None
+            or _view_contains_status_id(driver, required_visible_status_id)
+        ):
+            return confirmed
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(CONFIRMATION_REPLY_DISCOVERY_POLL_SECONDS, remaining))
+
+
+def _author_profile_replies_url(account_id: str) -> str | None:
+    try:
+        handle = normalize_handle(account_id)
+    except RuntimeConfigurationError:
+        return None
+    return f"https://x.com/{handle}/with_replies"
+
+
+def _confirmed_author_profile_reply_url(
+    browser_manager: Any,
+    driver: Any,
+    *,
+    account_id: str,
+    target_tweet_id: str,
+    reply_text: str | None,
+    reply_keywords: tuple[str, ...] = (),
+    confirmation_evidence: dict[str, Any] | None = None,
+) -> str | None:
+    """Confirm a profile-only reply while staying inside one read-only request."""
+
+    profile_url = _author_profile_replies_url(account_id)
+    if profile_url is None:
+        return None
+    if not _navigate_for_confirmation(
+        browser_manager,
+        driver,
+        profile_url,
+        page_load_timeout=CONFIRMATION_PROFILE_PAGE_LOAD_TIMEOUT_SECONDS,
+    ):
+        return None
+
+    profile_evidence: dict[str, Any] = {}
+    candidate = _wait_for_reply_proof(
+        driver,
+        account_id=account_id,
+        target_tweet_id=target_tweet_id,
+        reply_text=reply_text,
+        reply_keywords=reply_keywords,
+        confirmation_evidence=profile_evidence,
+    )
+    if candidate is None:
+        return None
+    candidate_pair = _canonical_status_href(candidate)
+    if candidate_pair is None:
+        return None
+    candidate_url, candidate_id = candidate_pair
+    if candidate_id == target_tweet_id:
+        return None
+
+    if not _navigate_for_confirmation(
+        browser_manager,
+        driver,
+        candidate_url,
+        page_load_timeout=CONFIRMATION_PROFILE_PAGE_LOAD_TIMEOUT_SECONDS,
+    ):
+        return None
+    permalink_evidence: dict[str, Any] = {}
+    confirmed = _wait_for_reply_proof(
+        driver,
+        account_id=account_id,
+        target_tweet_id=target_tweet_id,
+        reply_text=reply_text,
+        reply_keywords=reply_keywords,
+        confirmation_evidence=permalink_evidence,
+        required_visible_status_id=target_tweet_id,
+    )
+    confirmed_pair = _canonical_status_href(confirmed)
+    if confirmed_pair is None or confirmed_pair[1] != candidate_id:
+        return None
+
+    if confirmation_evidence is not None:
+        matched_text = permalink_evidence.get("matched_text") or profile_evidence.get(
+            "matched_text"
+        )
+        if isinstance(matched_text, str):
+            confirmation_evidence["matched_text"] = matched_text
+        confirmation_evidence["proof_source"] = "author_profile_replies"
+    return confirmed_pair[0]
+
+
 def _reply_disclosure_accessible_names(control: Any) -> tuple[str, ...]:
     """Return deduplicated individual semantic names for one control."""
 
@@ -1384,11 +1520,12 @@ def _confirmed_direct_reply_url(
 
     A source-tweet scan is primary because X can hide the accepted reply behind
     its probable-spam disclosure. We inspect normal replies first, reveal only
-    the semantic disclosure control, then re-scan. When that re-scan is the
-    proof, ``confirmation_evidence`` records it for the dashboard response.
-    This is exactly one source-thread navigation with a short DOM-render poll.
-    The durable dashboard WorkItem owns every later retry; confirmation never
-    navigates the old profile timeline or retries inside this HTTP request.
+    the semantic disclosure control, then re-scan. If the source thread still
+    omits the reply, one assigned-author profile timeline scan may find the
+    permalink; the direct permalink page must still expose the target status.
+    When a non-default proof path succeeds, ``confirmation_evidence`` records
+    it for the dashboard response. The durable dashboard WorkItem owns every
+    later retry; confirmation never retries publication inside this request.
     """
 
     source_url = target_tweet_url or f"https://x.com/i/web/status/{target_tweet_id}"
@@ -1447,6 +1584,18 @@ def _confirmed_direct_reply_url(
                         }
                     )
                 return confirmed
+
+        confirmed = _confirmed_author_profile_reply_url(
+            browser_manager,
+            driver,
+            account_id=account_id,
+            target_tweet_id=target_tweet_id,
+            reply_text=reply_text,
+            reply_keywords=reply_keywords,
+            confirmation_evidence=confirmation_evidence,
+        )
+        if confirmed:
+            return confirmed
 
         return None
     except Exception:
@@ -1625,11 +1774,15 @@ async def confirm_dashboard_action(
     if result:
         response = {"status": "confirmed", "permalink": result}
         # This is an observational receipt only: it is present exclusively
-        # when the source-thread proof followed a deliberate hidden-spam
-        # disclosure click. Normal/profile confirmation responses stay
-        # byte-for-byte compatible with the existing contract.
+        # when proof used a deliberate non-default read-only path. Normal
+        # source-thread confirmation responses stay byte-for-byte compatible
+        # with the existing contract.
         if confirmation_evidence.get("hidden_spam_disclosed") is True:
             response.update(confirmation_evidence)
+        elif confirmation_evidence.get("proof_source") == "author_profile_replies":
+            response["proof_source"] = "author_profile_replies"
+            if "matched_text" in confirmation_evidence:
+                response["matched_text"] = confirmation_evidence["matched_text"]
         elif "matched_text" in confirmation_evidence:
             response["matched_text"] = confirmation_evidence["matched_text"]
         return response

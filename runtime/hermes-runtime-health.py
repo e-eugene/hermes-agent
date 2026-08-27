@@ -125,6 +125,7 @@ def capabilities() -> list[str]:
         "x_like_tweet",
         "x_action_receipts_v2",
         "x_action_confirmation_hidden_spam_v1",
+        "x_action_confirmation_author_profile_v1",
         *base,
     ]
     if os.environ.get("HERMES_X_DIRECT_POSTING_ENABLED", "").strip().lower() in {

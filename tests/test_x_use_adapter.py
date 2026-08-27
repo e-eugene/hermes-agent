@@ -726,6 +726,86 @@ def reply_confirmation_browser(
     return Manager(driver), driver
 
 
+def profile_reply_confirmation_browser(
+    adapter,
+    *,
+    reply_text: str = "Exact accepted reply",
+    reply_href: str = "https://x.com/expected_user/status/456",
+    target_href: str = "https://x.com/source_user/status/123",
+):
+    """Build source/profile/permalink DOMs for profile-only reply proofs."""
+
+    class TextNode:
+        def __init__(self, text: str):
+            self.text = text
+
+    class Anchor:
+        def __init__(self, href: str):
+            self.href = href
+
+        def get_attribute(self, name: str):
+            return self.href if name == "href" else None
+
+    class Article:
+        def __init__(self, text: str, own_href: str | None, links: list[str]):
+            self.text = text
+            self.own_href = own_href
+            self.links = links
+
+        def find_elements(self, _by: str, selector: str):
+            if selector == ".//*[@data-testid='tweetText']":
+                return [TextNode(self.text)] if self.text else []
+            if selector == ".//a[@href and .//time]":
+                return [Anchor(self.own_href)] if self.own_href else []
+            if selector == adapter.STATUS_LINK_XPATH:
+                return [Anchor(href) for href in self.links]
+            return []
+
+    class Driver:
+        def __init__(self):
+            self.page = "source"
+            self.page_load_timeouts: list[float] = []
+
+        def find_elements(self, _by: str, selector: str):
+            if selector == adapter.REPLY_DISCLOSURE_CONTROL_XPATH:
+                return []
+            if selector != adapter.TWEET_ARTICLE_XPATH:
+                return []
+            if self.page == "profile":
+                return [Article(reply_text, reply_href, [reply_href])]
+            if self.page == "permalink":
+                return [
+                    Article("Source post", target_href, [target_href]),
+                    Article(reply_text, reply_href, [reply_href, target_href]),
+                ]
+            return []
+
+        def set_page_load_timeout(self, value: float):
+            self.page_load_timeouts.append(value)
+
+    class Manager:
+        def __init__(self, driver):
+            self.driver = driver
+            self.navigations: list[str] = []
+
+        def navigate_to(self, url: str, ensure_driver: bool = True):
+            assert ensure_driver is False
+            self.navigations.append(url)
+            if url.endswith("/with_replies"):
+                self.driver.page = "profile"
+            elif url == reply_href:
+                self.driver.page = "permalink"
+            else:
+                self.driver.page = "source"
+            return True
+
+        def get_driver(self):
+            pytest.fail("confirmation must not reattach a browser target")
+
+    driver = Driver()
+    return Manager(driver), driver
+
+
 def install_confirmation_clock(adapter, monkeypatch: pytest.MonkeyPatch) -> list[float]:
     """Advance the bounded DOM-poll clock without making tests wait five seconds."""
 
@@ -765,6 +845,67 @@ def test_reply_confirmation_checks_source_thread_with_absolute_status_href(adapt
         adapter.CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
         adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
     ]
+    assert evidence == {}
+
+
+def test_reply_confirmation_falls_back_to_author_profile_replies(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, driver = profile_reply_confirmation_browser(adapter)
+    sleeps = install_confirmation_clock(adapter, monkeypatch)
+    evidence: dict[str, object] = {}
+
+    result = adapter._confirmed_direct_reply_url(
+        manager,
+        "expected_user",
+        "123",
+        "Exact accepted reply",
+        "https://x.com/source_user/status/123",
+        evidence,
+    )
+
+    assert result == "https://x.com/expected_user/status/456"
+    assert manager.navigations == [
+        "https://x.com/source_user/status/123",
+        "https://x.com/expected_user/with_replies",
+        "https://x.com/expected_user/status/456",
+    ]
+    assert sleeps
+    assert driver.page_load_timeouts == [
+        adapter.CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.CONFIRMATION_PROFILE_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.CONFIRMATION_PROFILE_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
+    ]
+    assert evidence == {"proof_source": "author_profile_replies"}
+
+
+def test_reply_confirmation_rejects_profile_match_without_target_context(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, driver = profile_reply_confirmation_browser(
+        adapter,
+        target_href="https://x.com/other_source/status/999",
+    )
+    install_confirmation_clock(adapter, monkeypatch)
+    evidence: dict[str, object] = {}
+
+    result = adapter._confirmed_direct_reply_url(
+        manager,
+        "expected_user",
+        "123",
+        "Exact accepted reply",
+        "https://x.com/source_user/status/123",
+        evidence,
+    )
+
+    assert result is None
+    assert manager.navigations == [
+        "https://x.com/source_user/status/123",
+        "https://x.com/expected_user/with_replies",
+        "https://x.com/expected_user/status/456",
+    ]
+    assert driver.page_load_timeouts[-1] == adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS
     assert evidence == {}
 
 
@@ -925,13 +1066,15 @@ def test_reply_confirmation_does_not_click_an_unrecognized_disclosure_control(
     assert driver.disclosure.clicks == 0
     assert manager.navigations == [
         "https://x.com/source_user/status/123",
+        "https://x.com/expected_user/with_replies",
     ]
     assert driver.page_load_timeouts == [
         adapter.CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.CONFIRMATION_PROFILE_PAGE_LOAD_TIMEOUT_SECONDS,
         adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
     ]
     assert sum(sleeps) == pytest.approx(
-        adapter.CONFIRMATION_REPLY_DISCOVERY_TIMEOUT_SECONDS
+        adapter.CONFIRMATION_REPLY_DISCOVERY_TIMEOUT_SECONDS * 2
     )
 
 
@@ -987,9 +1130,11 @@ def test_reply_confirmation_rejects_identical_text_from_another_account(
     assert result is None
     assert manager.navigations == [
         "https://x.com/source_user/status/123",
+        "https://x.com/expected_user/with_replies",
     ]
     assert manager.driver.page_load_timeouts == [
         adapter.CONFIRMATION_PAGE_LOAD_TIMEOUT_SECONDS,
+        adapter.CONFIRMATION_PROFILE_PAGE_LOAD_TIMEOUT_SECONDS,
         adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
     ]
 
@@ -1230,6 +1375,51 @@ def test_dashboard_reply_confirmation_reports_hidden_spam_proof(
     }
     assert driver.disclosure is not None
     assert driver.disclosure.clicks == 1
+
+
+def test_dashboard_reply_confirmation_reports_author_profile_proof(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, driver = profile_reply_confirmation_browser(
+        adapter,
+        reply_text="PersProtect.com helps reduce exposed personal data.",
+    )
+    install_confirmation_clock(adapter, monkeypatch)
+
+    class Pool:
+        @asynccontextmanager
+        async def confirmation_session(self, account: str):
+            assert account == "expected_user"
+            yield manager
+
+    async def unexpected_write(*_args, **_kwargs):
+        pytest.fail("receipt confirmation must not send an X write")
+
+    monkeypatch.setattr(adapter, "runtime_config_loader", lambda: object())
+    monkeypatch.setattr(adapter, "session_pool", lambda _loader: Pool())
+    monkeypatch.setattr(adapter.actions, "exec_reply", unexpected_write)
+    monkeypatch.setattr(adapter.actions, "exec_like", unexpected_write, raising=False)
+
+    result = asyncio.run(
+        adapter.confirm_dashboard_action(
+            action="reply",
+            target_tweet_url="https://x.com/source_user/status/123",
+            reply_keywords=["PersProtect.com", "persprotect"],
+        )
+    )
+
+    assert result == {
+        "status": "confirmed",
+        "permalink": "https://x.com/expected_user/status/456",
+        "proof_source": "author_profile_replies",
+        "matched_text": "PersProtect.com helps reduce exposed personal data.",
+    }
+    assert manager.navigations == [
+        "https://x.com/source_user/status/123",
+        "https://x.com/expected_user/with_replies",
+        "https://x.com/expected_user/status/456",
+    ]
+    assert driver.page_load_timeouts[-1] == adapter.DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS
 
 
 def test_like_tweet_executes_one_canonical_verified_like(
