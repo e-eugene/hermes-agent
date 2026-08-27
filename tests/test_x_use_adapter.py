@@ -880,6 +880,69 @@ def test_reply_confirmation_falls_back_to_author_profile_replies(
     assert evidence == {"proof_source": "author_profile_replies"}
 
 
+def test_reply_confirmation_accepts_two_word_profile_match(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _driver = profile_reply_confirmation_browser(
+        adapter,
+        reply_text=(
+            'Hashed passwords exposed too? "Hashed" is not a magic privacy shield.'
+        ),
+    )
+    install_confirmation_clock(adapter, monkeypatch)
+
+    result = adapter._confirmed_direct_reply_url(
+        manager,
+        "expected_user",
+        "123",
+        "Hashed passwords changed entirely.",
+        "https://x.com/source_user/status/123",
+        {},
+    )
+
+    assert result == "https://x.com/expected_user/status/456"
+    assert manager.navigations == [
+        "https://x.com/source_user/status/123",
+        "https://x.com/expected_user/with_replies",
+        "https://x.com/expected_user/status/456",
+    ]
+
+
+def test_reply_confirmation_normalizes_quote_style_through_word_match(adapter) -> None:
+    assert adapter._reply_matches_confirmation_criteria(
+        'Hashed passwords exposed too? "Hashed" is not a magic privacy shield.',
+        reply_text=(
+            "Hashed passwords exposed too? “Hashed” is not a magic privacy shield."
+        ),
+        reply_keywords=(),
+    )
+
+
+def test_reply_confirmation_rejects_one_word_profile_match(
+    adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _driver = profile_reply_confirmation_browser(
+        adapter,
+        reply_text="Hashed content changed completely.",
+    )
+    install_confirmation_clock(adapter, monkeypatch)
+
+    result = adapter._confirmed_direct_reply_url(
+        manager,
+        "expected_user",
+        "123",
+        "Hashed passwords are exposed too.",
+        "https://x.com/source_user/status/123",
+        {},
+    )
+
+    assert result is None
+    assert manager.navigations == [
+        "https://x.com/source_user/status/123",
+        "https://x.com/expected_user/with_replies",
+    ]
+
+
 def test_reply_confirmation_rejects_profile_match_without_target_context(
     adapter, monkeypatch: pytest.MonkeyPatch
 ) -> None:

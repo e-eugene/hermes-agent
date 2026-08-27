@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -1127,6 +1128,17 @@ def _normalized_visible_text(value: object) -> str:
     return " ".join(str(value or "").split())
 
 
+def _reply_match_tokens(value: object) -> frozenset[str]:
+    """Return distinct meaningful Unicode tokens for partial reply proof."""
+
+    normalized = _normalized_visible_text(value).casefold()
+    return frozenset(
+        token
+        for token in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+        if len(token) >= 3
+    )
+
+
 def _normalized_reply_keywords(value: object) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
@@ -1149,7 +1161,14 @@ def _reply_matches_confirmation_criteria(
     reply_keywords: tuple[str, ...],
 ) -> bool:
     if reply_text is not None:
-        return visible_text == _normalized_visible_text(reply_text)
+        normalized_visible = _normalized_visible_text(visible_text)
+        normalized_expected = _normalized_visible_text(reply_text)
+        if normalized_visible == normalized_expected:
+            return True
+        return len(
+            _reply_match_tokens(normalized_visible)
+            & _reply_match_tokens(normalized_expected)
+        ) >= 2
     haystack = visible_text.casefold()
     return bool(haystack) and any(keyword in haystack for keyword in reply_keywords)
 
