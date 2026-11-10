@@ -825,6 +825,74 @@ def install_confirmation_clock(adapter, monkeypatch: pytest.MonkeyPatch) -> list
     return sleeps
 
 
+def test_profile_thread_proof_selects_the_target_conversation_and_fails_closed(adapter):
+    class Anchor:
+        def __init__(self, href):
+            self.href = href
+
+        def get_attribute(self, name):
+            return self.href if name == "href" else None
+
+    class Article:
+        def __init__(self, href, text, *, repost=False):
+            self.href, self.text, self.repost = href, text, repost
+
+        def find_elements(self, _by, selector):
+            if selector == ".//*[@data-testid='socialContext']":
+                return [object()] if self.repost else []
+            if selector == ".//a[@href and .//time]":
+                return [Anchor(self.href)]
+            if selector == ".//*[@data-testid='tweetText']":
+                return [SimpleNamespace(text=self.text)]
+            return []
+
+    class Cell:
+        def __init__(self, article=None):
+            self.article = article
+            self.text = article.text if article else ""
+
+        def find_elements(self, _by, _selector):
+            return [self.article] if self.article else []
+
+    newer = Article("https://x.com/expected_user/status/901", "PersProtect helps")
+    target = Article("https://x.com/other/status/123", "Target")
+    right = Article("https://x.com/expected_user/status/456", "PersProtect helps too")
+    cells = [Cell(), Cell(Article("https://x.com/other/status/999", "Other")),
+             Cell(newer), Cell(), Cell(target), Cell(right), Cell()]
+    driver = SimpleNamespace(find_elements=lambda _by, _selector: cells)
+    kwargs = dict(account_id="expected_user", target_tweet_id="123", reply_text=None,
+                  reply_keywords=("persprotect",))
+
+    assert adapter._profile_thread_reply(driver, **kwargs) == right.href
+    assert adapter._profile_thread_reply(driver, **{**kwargs, "target_tweet_id": "777"}) is None
+    target.repost = True
+    assert adapter._profile_thread_reply(driver, **kwargs) is None
+    target.repost = False
+    right.href = "https://x.com/other_user/status/456"
+    assert adapter._profile_thread_reply(driver, **kwargs) is None
+    right.href = "https://x.com/expected_user/status/456"
+    cells[-1] = Cell(Article("https://x.com/other/status/888", "No separator"))
+    assert adapter._profile_thread_reply(driver, **kwargs) is None
+
+
+def test_profile_thread_proof_rechecks_reply_when_parent_hidden(adapter, monkeypatch):
+    manager, _driver = profile_reply_confirmation_browser(
+        adapter, target_href="https://x.com/other_source/status/999"
+    )
+    install_confirmation_clock(adapter, monkeypatch)
+    monkeypatch.setattr(
+        adapter, "_profile_thread_reply",
+        lambda *_args, **_kwargs: "https://x.com/expected_user/status/456",
+    )
+    evidence = {}
+    result = adapter._confirmed_direct_reply_url(
+        manager, "expected_user", "123", "Exact accepted reply",
+        "https://x.com/source_user/status/123", evidence, ("persprotect",),
+    )
+    assert result == "https://x.com/expected_user/status/456"
+    assert evidence == {"proof_source": "author_profile_thread"}
+
+
 def test_reply_confirmation_checks_source_thread_with_absolute_status_href(adapter) -> None:
     manager, driver = reply_confirmation_browser(adapter, reply_visible=True)
     evidence: dict[str, object] = {}

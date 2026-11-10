@@ -1306,6 +1306,64 @@ def _author_profile_replies_url(account_id: str) -> str | None:
     return f"https://x.com/{handle}/with_replies"
 
 
+def _profile_thread_reply(
+    driver: Any,
+    *,
+    account_id: str,
+    target_tweet_id: str,
+    reply_text: str | None,
+    reply_keywords: tuple[str, ...],
+) -> str | None:
+    """Recognize a bounded two-post thread in X's rendered replies timeline.
+
+    Fail closed unless the target and the assigned author's matching reply are
+    the only two tweet cells between empty timeline separators. This avoids
+    attributing a different, similarly worded reply to the target.
+    """
+    try:
+        cells = driver.find_elements("css selector", '[data-testid="cellInnerDiv"]')
+        groups: list[str] = []
+        for index in range(1, len(cells) - 2):
+            before, parent_cell, reply_cell, after = cells[index - 1 : index + 3]
+            if (
+                before.text.strip()
+                or after.text.strip()
+                or before.find_elements("xpath", ".//article[@data-testid='tweet']")
+                or after.find_elements("xpath", ".//article[@data-testid='tweet']")
+            ):
+                continue
+            parent_articles = parent_cell.find_elements("xpath", ".//article[@data-testid='tweet']")
+            reply_articles = reply_cell.find_elements("xpath", ".//article[@data-testid='tweet']")
+            if len(parent_articles) != 1 or len(reply_articles) != 1:
+                continue
+            parent = parent_articles[0]
+            reply = reply_articles[0]
+            if parent.find_elements("xpath", ".//*[@data-testid='socialContext']"):
+                continue
+            parent_links = parent.find_elements("xpath", ".//a[@href and .//time]")
+            if not any(
+                (pair := _canonical_status_href(anchor.get_attribute("href")))
+                and pair[1] == target_tweet_id
+                for anchor in parent_links
+            ):
+                continue
+            texts = reply.find_elements("xpath", ".//*[@data-testid='tweetText']")
+            visible_text = _normalized_visible_text("\n".join(node.text for node in texts))
+            if not _reply_matches_confirmation_criteria(
+                visible_text, reply_text=reply_text, reply_keywords=reply_keywords
+            ):
+                continue
+            for anchor in reply.find_elements("xpath", ".//a[@href and .//time]"):
+                pair = _canonical_status_href(anchor.get_attribute("href"))
+                if pair and pair[1] != target_tweet_id and pair[0].startswith(
+                    f"https://x.com/{account_id}/status/"
+                ):
+                    groups.append(pair[0])
+        return groups[0] if len(set(groups)) == 1 else None
+    except Exception:
+        return None
+
+
 def _confirmed_author_profile_reply_url(
     browser_manager: Any,
     driver: Any,
@@ -1330,14 +1388,33 @@ def _confirmed_author_profile_reply_url(
         return None
 
     profile_evidence: dict[str, Any] = {}
-    candidate = _wait_for_reply_proof(
-        driver,
-        account_id=account_id,
-        target_tweet_id=target_tweet_id,
-        reply_text=reply_text,
-        reply_keywords=reply_keywords,
-        confirmation_evidence=profile_evidence,
-    )
+    deadline = time.monotonic() + CONFIRMATION_REPLY_DISCOVERY_TIMEOUT_SECONDS
+    thread_candidate = None
+    fallback_candidate = None
+    while True:
+        # The dashboard supplies these server-owned keywords only for the
+        # second stage. A profile-only proof must never start another X write.
+        if reply_keywords:
+            thread_candidate = _profile_thread_reply(
+                driver,
+                account_id=account_id,
+                target_tweet_id=target_tweet_id,
+                reply_text=reply_text,
+                reply_keywords=reply_keywords,
+            )
+        fallback_candidate = _reply_permalink_from_view(
+            driver,
+            account_id=account_id,
+            target_tweet_id=target_tweet_id,
+            reply_text=reply_text,
+            reply_keywords=reply_keywords,
+            confirmation_evidence=profile_evidence,
+        )
+        remaining = deadline - time.monotonic()
+        if thread_candidate is not None or remaining <= 0:
+            break
+        time.sleep(min(CONFIRMATION_REPLY_DISCOVERY_POLL_SECONDS, remaining))
+    candidate = thread_candidate or fallback_candidate
     if candidate is None:
         return None
     candidate_pair = _canonical_status_href(candidate)
@@ -1362,7 +1439,7 @@ def _confirmed_author_profile_reply_url(
         reply_text=reply_text,
         reply_keywords=reply_keywords,
         confirmation_evidence=permalink_evidence,
-        required_visible_status_id=target_tweet_id,
+        required_visible_status_id=None if thread_candidate else target_tweet_id,
     )
     confirmed_pair = _canonical_status_href(confirmed)
     if confirmed_pair is None or confirmed_pair[1] != candidate_id:
@@ -1374,7 +1451,9 @@ def _confirmed_author_profile_reply_url(
         )
         if isinstance(matched_text, str):
             confirmation_evidence["matched_text"] = matched_text
-        confirmation_evidence["proof_source"] = "author_profile_replies"
+        confirmation_evidence["proof_source"] = (
+            "author_profile_thread" if thread_candidate else "author_profile_replies"
+        )
     return confirmed_pair[0]
 
 
@@ -1798,8 +1877,11 @@ async def confirm_dashboard_action(
         # with the existing contract.
         if confirmation_evidence.get("hidden_spam_disclosed") is True:
             response.update(confirmation_evidence)
-        elif confirmation_evidence.get("proof_source") == "author_profile_replies":
-            response["proof_source"] = "author_profile_replies"
+        elif confirmation_evidence.get("proof_source") in {
+            "author_profile_replies",
+            "author_profile_thread",
+        }:
+            response["proof_source"] = confirmation_evidence["proof_source"]
             if "matched_text" in confirmation_evidence:
                 response["matched_text"] = confirmation_evidence["matched_text"]
         elif "matched_text" in confirmation_evidence:
