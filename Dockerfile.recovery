@@ -1,0 +1,8 @@
+# This recovery release keeps the exact currently deployed browser and
+# dependencies while applying the proxy-state fix. The main Dockerfile remains
+# the canonical full build for future upgrades.
+FROM ghcr.io/e-eugene/hermes-agent@sha256:77f2763b38d6e716c31f51c900204c1fa996b284d86036b513b6ea2a08becf4d
+
+USER root
+COPY runtime/residential-proxy.py /usr/local/bin/residential-proxy
+RUN chmod 0755 /usr/local/bin/residential-proxy

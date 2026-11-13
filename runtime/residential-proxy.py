@@ -19,7 +19,6 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-
 LOCAL_HOST = "127.0.0.1"
 LOCAL_PORT = int(os.environ.get("HERMES_RESIDENTIAL_PROXY_PORT", "8899"))
 STATE_PATH = Path(os.environ.get("HERMES_RESIDENTIAL_PROXY_STATE_PATH", "/opt/data/residential-proxy/state.json"))
@@ -36,9 +35,9 @@ def selector() -> str:
         value = json.loads(STATE_PATH.read_text()).get("selector", "")
         if value == "rotate" or (isinstance(value, str) and value.isdecimal()):
             return value
-    except (OSError, ValueError, TypeError):
-        pass
-    return session_id()
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("Residential proxy session state is unavailable") from exc
+    raise ValueError("Residential proxy session state is invalid")
 
 
 def write_selector(value: str) -> None:
@@ -65,13 +64,11 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 def blocked_media_hosts() -> tuple[str, ...]:
     configured = os.environ.get("HERMES_RESIDENTIAL_PROXY_BLOCKED_MEDIA_HOSTS")
-    if not configured:
+    if configured is not None:
+        return tuple(host.strip().lower() for host in configured.split(",") if host.strip())
+    if env_bool("HERMES_X_LOW_DATA_MODE", default=True):
         return DEFAULT_BLOCKED_MEDIA_HOSTS
-    return tuple(
-        host.strip().lower()
-        for host in configured.split(",")
-        if host.strip()
-    )
+    return ()
 
 
 def normalize_host(value: object) -> str:
@@ -233,10 +230,10 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
             block_reason = "media_host"
             outcome = "blocked"
             response = (
-                "HTTP/1.1 403 Forbidden\r\n"
-                "X-Residential-Proxy-Blocked: media\r\n"
-                "Connection: close\r\n\r\n"
-            ).encode()
+                b"HTTP/1.1 403 Forbidden\r\n"
+                b"X-Residential-Proxy-Blocked: media\r\n"
+                b"Connection: close\r\n\r\n"
+            )
             bytes_to_client += len(response)
             client_writer.write(response)
             await client_writer.drain()
@@ -331,6 +328,9 @@ async def serve() -> None:
     )
     if not STATE_PATH.exists():
         write_selector(session_id())
+    # An unreadable or malformed state must never silently create a new proxy
+    # session for each connection: a changing IP can invalidate X verification.
+    selector()
     server = await asyncio.start_server(handle_client, LOCAL_HOST, LOCAL_PORT)
     async with server:
         await server.serve_forever()

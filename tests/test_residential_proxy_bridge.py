@@ -40,6 +40,35 @@ def test_bridge_persists_mode_and_builds_upstream_auth(
     assert "Proxy-Authorization: Basic fresh" in headers
 
 
+@pytest.mark.parametrize("contents", [None, "not json", "{}", '{"selector": ""}'])
+def test_bridge_does_not_rotate_when_session_state_is_missing_or_invalid(
+    tmp_path: Path, monkeypatch, contents: str | None
+) -> None:
+    bridge = load_bridge_module()
+    bridge.STATE_PATH = tmp_path / "state.json"
+    if contents is not None:
+        bridge.STATE_PATH.write_text(contents)
+    monkeypatch.setattr(
+        bridge, "session_id", lambda: pytest.fail("must not create a fallback session")
+    )
+
+    for _ in range(2):
+        with pytest.raises(ValueError, match="Residential proxy session state"):
+            bridge.selector()
+
+
+def test_bridge_allows_x_media_when_low_data_mode_is_disabled(monkeypatch) -> None:
+    bridge = load_bridge_module()
+    monkeypatch.delenv("HERMES_RESIDENTIAL_PROXY_BLOCKED_MEDIA_HOSTS", raising=False)
+    monkeypatch.setenv("HERMES_X_LOW_DATA_MODE", "false")
+    assert not bridge.media_host_blocked("pbs.twimg.com")
+    assert not bridge.media_host_blocked("video.twimg.com")
+
+    monkeypatch.setenv("HERMES_RESIDENTIAL_PROXY_BLOCKED_MEDIA_HOSTS", "pbs.twimg.com")
+    assert bridge.media_host_blocked("pbs.twimg.com")
+    assert not bridge.media_host_blocked("video.twimg.com")
+
+
 def test_bridge_forwards_http_request_with_upstream_auth(monkeypatch, tmp_path: Path) -> None:
     async def exercise() -> bytes:
         captured: list[bytes] = []
