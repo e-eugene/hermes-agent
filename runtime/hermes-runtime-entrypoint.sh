@@ -145,7 +145,6 @@ rm -f /tmp/hermes-x-use/native-mcp-ready.json
 /opt/hermes/.venv/bin/python -c '
 import json
 import os
-import sys
 from pathlib import Path
 
 path = Path(os.environ["HERMES_SOCIAL_ACCOUNTS_PATH"])
@@ -252,6 +251,7 @@ fi
 
 /opt/hermes/.venv/bin/python -c '
 import os
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 import yaml
