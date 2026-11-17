@@ -17,8 +17,14 @@ def test_entrypoint_config_python_preamble_executes() -> None:
         'path = Path("/opt/data/config.yaml")', 1
     )[0]
     env = dict(os.environ, PYTHONPATH=str(root / "runtime"))
+    # The image provides PyYAML, while the lightweight CI test environment
+    # does not need it: only exercise imports before the config is loaded.
+    bootstrap = "import sys, types; sys.modules['yaml'] = types.ModuleType('yaml')\n"
     result = subprocess.run(
-        [sys.executable, "-c", preamble], capture_output=True, text=True, env=env
+        [sys.executable, "-S", "-c", bootstrap + preamble],
+        capture_output=True,
+        text=True,
+        env=env,
     )
     assert result.returncode == 0, result.stderr
 
