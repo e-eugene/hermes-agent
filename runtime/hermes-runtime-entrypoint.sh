@@ -145,6 +145,7 @@ rm -f /tmp/hermes-x-use/native-mcp-ready.json
 /opt/hermes/.venv/bin/python -c '
 import json
 import os
+import sys
 from pathlib import Path
 
 path = Path(os.environ["HERMES_SOCIAL_ACCOUNTS_PATH"])
@@ -255,8 +256,16 @@ from pathlib import Path
 from urllib.parse import urlsplit
 import yaml
 
+sys.path.insert(0, "/opt/hermes-runtime")
+from hermes_fallback import configure_llm7_fallback
+
 path = Path("/opt/data/config.yaml")
 config = yaml.safe_load(path.read_text()) or {}
+configure_llm7_fallback(
+    config,
+    os.environ.get("HERMES_PRESET_PROVIDER", ""),
+    os.environ.get("HERMES_PRESET_BASE_URL", ""),
+)
 config.setdefault("platform_toolsets", {})["api_server"] = [
     "terminal",
     "x_use",

@@ -61,6 +61,7 @@ COPY runtime/hermes-x-use-configure.py /usr/local/bin/hermes-x-use-configure
 COPY runtime/hermes-x-use-native-preflight.py /usr/local/bin/hermes-x-use-native-preflight
 COPY runtime/hermes_x_use_common.py /opt/hermes-runtime/hermes_x_use_common.py
 COPY runtime/hermes_x_use_adapter.py /opt/hermes-runtime/hermes_x_use_adapter.py
+COPY runtime/hermes_fallback.py /opt/hermes-runtime/hermes_fallback.py
 
 RUN chmod 0755 \
     /usr/local/bin/hermes-browser-supervisor \
